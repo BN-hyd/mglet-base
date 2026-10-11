@@ -22,7 +22,9 @@ This implementation uses constant isotropic **molecular** diffusivity
 Prandtl/Schmidt number. No independent `D` key is added.
 `k_s` has units of length/time and must be finite and nonnegative;
 `c_eq` has the scalar's units, is finite, and defaults to zero.
-`prmol` and the resulting `D` must be finite and positive.
+`gmol`, `rho`, `prmol`, and the resulting `D` must be finite and positive.
+Material properties are checked before evaluating the diffusivity ratio;
+two negative properties cannot pass by producing a positive ratio.
 Use consistent dimensional or nondimensional units throughout an input.
 For nondimensional inputs, scale `k_s` by the reference velocity.
 
@@ -116,10 +118,34 @@ STL surface and spatial refinement are required.
 
 If the ordinary selection fails, a nearest eligible fluid-side BP-open
 point from the existing search list provides a reported one-point fallback.
-No valid point, invalid normal/area, unresolved body identity, or an
-unrepresented reactive patch causes a fatal error rather than silent zero
-absorption. Existing geometry processing assigns one body to each patch;
-multiple contacting surfaces inside one cell must be resolved by refinement.
+A corner-only GC intersection can have a valid wall plane and positive
+area although its center has `BT=0`: the Cartesian activation mask sees
+face neighbors, while the immersed patch can meet fluid diagonally. Such
+a patch retains its existing GC area, plane, and body. Its flux is applied
+to an eligible owned, active fluid observation with the same `FINECELL`
+membership, using that receiving cell's Cartesian volume. Transfers and
+one-point fallbacks are counted in startup diagnostics. Multiple patches
+may contribute to one receiver; their RHS contributions are accumulated.
+
+The existing GC geometry deliberately sets its normal to zero when a
+patch's area divided by a representative Cartesian face area is below
+`maccur**2`. For this specific tiny-area degeneracy, Robin borrows the
+nearest valid unit GC normal from the same body in the existing search
+neighborhood, and anchors its plane at the original patch's `gc%xpsw`.
+It retains the full positive area and reports normal-rescue counts. No
+sphere-center geometry is constructed. Missing valid neighbors still
+cause a fatal error. Exactly zero-measure GC patches are counted separately;
+they contribute zero absorption by definition. This local normal rescue
+remains an approximation requiring spatial refinement.
+
+No valid observation or receiver, invalid normal/area, or unresolved body
+identity causes a fatal error rather than silent zero absorption. The
+receiver search is limited to the existing local GC search list and the
+owned grid interior. Extremely narrow gaps and patches requiring a
+receiver across a block edge can therefore fail explicitly; MPI and grid
+partition tests must cover the geometry used by an application. Existing
+geometry processing assigns one body to each patch; multiple contacting
+surfaces inside one cell must be resolved by refinement.
 
 ## Conserved quantity and RK integration
 
@@ -136,7 +162,8 @@ M_h=\sum_{active\ leaf\ cells} BT_i\,\Delta V_i C_i.
 \]
 
 Each geometric patch contributes `-A*J_out/DeltaV` exactly once to its
-owner's RHS. The stage concentration field is read without modification.
+active owner's or reported fallback receiver's RHS. The stage concentration
+field is read without modification.
 The legacy stencil routines act only on types 0 and 1, so Robin does not
 also overwrite ghost values. Internal face fluxes still cancel in this
 Cartesian budget. The zero-rate path reduces to the legacy zero-flux path.
@@ -165,12 +192,27 @@ volume sources and non-Robin boundaries. In the verification cases there
 are no volume sources, so it represents the outer-boundary contribution.
 `ROBIN_RATE` reports the last RK RHS evaluation's instantaneous positive
 and negative surface rates, not the end-of-step concentration's rate.
+Positive and negative amounts are separated per patch before accumulation,
+so opposing patches sharing a receiver do not cancel out of this report.
 MPI reductions and `FINECELL` exclude halo cells and covered coarse cells.
 The budget also exposes nonconservative changes made by mixed legacy
 Dirichlet ghost overwrites; it cannot make those old updates conservative.
 
+Ghost-cell runs also print `ROBIN_VOLP_POINT_BUDGET` with the same columns.
+Its mass is `sum(FINECELL*VOLP*C_point)`, where `VOLP` is an absolute fluid
+volume and the transported concentration is a point value. It is a
+physical-storage approximation, not a cut-cell volume-average mass. The
+same RK supply and uptake are retained; the resulting residual is reported
+without forcing it to zero. It equals the step change in the difference
+between this approximate storage and `M_h`, plus the discrete residual.
+See the validation record for independently checked HDF5 masses and the
+remaining strict physical-conservation acceptance limitation.
+
 The explicit stage guard bounds the molecular diffusion row norm plus
-surface sink row norm, multiplied by `dt*max(abs(RK b))`, to 0.5. It checks
+the summed surface sink row norm at each receiver, multiplied by
+`dt*max(abs(RK b))`, to 0.5. All patches sharing a receiver contribute to
+that bound; checking each patch separately would miss combined stiffness.
+It checks
 every stage, including after the existing adaptive flow timestep changes.
 An unsafe step aborts with a recommended upper bound; no scalar-specific
 substepping or silent change to the coupled flow timestep is made. Because
@@ -215,7 +257,10 @@ The unit test directly calls the production Fortran kernel. Integration
 tests run the real solver: planar resistance/profile, zero/large rates,
 equilibrium and reverse flux, three mesh sizes, RK timestep refinement,
 multiple scalars against isolated runs, a two-Robin-sphere finite shell,
-mass budgets, MPI, restart, and old value/flux conditions. The finite shell
+curved-surface timestep refinement and relaxation, mass budgets, MPI,
+restart, and old value/flux conditions. The sphere grids share one fixed
+resolved STL, so the grid comparison isolates Cartesian refinement.
+The finite shell
 reference is
 
 \[

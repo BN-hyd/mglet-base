@@ -187,6 +187,13 @@ CONTAINS
                         "Robin scalar requires positive finite prmol", &
                         __FILE__, __LINE__)
                 END IF
+                IF (.NOT. ieee_is_finite(gmol) .OR. &
+                        .NOT. ieee_is_finite(rho) .OR. &
+                        gmol <= 0.0_realk .OR. rho <= 0.0_realk) THEN
+                    CALL err_abort(254_intk, &
+                        "Robin requires positive finite gmol and rho", &
+                        __FILE__, __LINE__)
+                END IF
                 rvalue = gmol/rho/scalar(l)%prmol
                 IF (.NOT. ieee_is_finite(rvalue) .OR. rvalue <= 0.0_realk) THEN
                     CALL err_abort(254_intk, &

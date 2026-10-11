@@ -13,6 +13,7 @@ MODULE timeintegrate_scalar_mod
 
     REAL(realk), ALLOCATABLE :: robin_mass0(:), robin_amount(:, :)
     REAL(realk), ALLOCATABLE :: robin_accum(:, :)
+    REAL(realk), ALLOCATABLE :: robin_volp_point_mass0(:)
 
     PUBLIC :: timeintegrate_scalar, itinfo_scalar
 
@@ -29,7 +30,8 @@ CONTAINS
         ! Local variables
         INTEGER(intk) :: ilevel, l
         REAL(realk) :: frhs, fu, dtrk, dtrki, budget(2), mass, residual
-        REAL(realk) :: uptake, release
+        REAL(realk) :: volp_point_mass, volp_point_residual
+        REAL(realk) :: surface_rates(2)
         TYPE(field_t), POINTER :: t, told, dt_f
         TYPE(field_t) :: qtt, qtu, qtv, qtw, reaction
 
@@ -39,7 +41,7 @@ CONTAINS
         IF (ANY(scalar%robin_budget) .AND. &
                 .NOT. ALLOCATED(robin_mass0)) THEN
             ALLOCATE(robin_mass0(nsca), robin_amount(2, nsca), &
-                robin_accum(2, nsca))
+                robin_accum(2, nsca), robin_volp_point_mass0(nsca))
         END IF
 
         ! Local temporary storage ("scrap")
@@ -63,6 +65,10 @@ CONTAINS
 
             IF (scalar(l)%robin_budget .AND. irk == 1) THEN
                 CALL scalar_integral(robin_mass0(l), t)
+                IF (ib%type == "GHOSTCELL") THEN
+                    CALL scalar_integral(robin_volp_point_mass0(l), t, &
+                        volp_weight=.TRUE.)
+                END IF
                 robin_amount(:, l) = 0.0_realk
                 robin_accum(:, l) = 0.0_realk
             END IF
@@ -93,7 +99,8 @@ CONTAINS
 
             reaction%arr = 0.0_realk
             IF (scalar(l)%has_robin) THEN
-                CALL apply_robin(qtt, reaction, t, scalar(l), dt, &
+                CALL apply_robin(qtt, reaction, surface_rates, t, &
+                    scalar(l), dt, &
                     MAXVAL(ABS(rkscheme%b(1:rkscheme%nrk))))
             END IF
 
@@ -134,8 +141,17 @@ CONTAINS
                 CALL scalar_integral(mass, t)
                 residual = mass - robin_mass0(l) - robin_amount(1, l) &
                     + robin_amount(2, l)
-                CALL scalar_integral(uptake, reaction, 1)
-                CALL scalar_integral(release, reaction, -1)
+                IF (ib%type == "GHOSTCELL") THEN
+                    ! VOLP is the geometric fluid volume, while t stores
+                    ! transport point values. This weighted approximation
+                    ! exposes the physical storage difference; it does not
+                    ! assert cut-volume conservation of the BT operator.
+                    CALL scalar_integral(volp_point_mass, t, &
+                        volp_weight=.TRUE.)
+                    volp_point_residual = volp_point_mass &
+                        - robin_volp_point_mass0(l) - robin_amount(1, l) &
+                        + robin_amount(2, l)
+                END IF
                 IF (myid == 0) THEN
                     WRITE(*, '(A, 1X, A, 1X, I0, 6(1X, ES24.16))') &
                         "ROBIN_BUDGET", TRIM(scalar(l)%name), ittot, &
@@ -143,7 +159,15 @@ CONTAINS
                         robin_amount(:, l), residual
                     WRITE(*, '(A, 1X, A, 1X, I0, 2(1X, ES24.16))') &
                         "ROBIN_RATE", TRIM(scalar(l)%name), ittot, &
-                        uptake, release
+                        surface_rates
+                    IF (ib%type == "GHOSTCELL") THEN
+                        WRITE(*, '(A, 1X, A, 1X, I0, 6(1X, ES24.16))') &
+                            "ROBIN_VOLP_POINT_BUDGET", &
+                            TRIM(scalar(l)%name), ittot, timeph + dt, &
+                            volp_point_mass, &
+                            volp_point_mass - robin_volp_point_mass0(l), &
+                            robin_amount(:, l), volp_point_residual
+                    END IF
                 END IF
             END IF
 
@@ -161,18 +185,23 @@ CONTAINS
     END SUBROUTINE timeintegrate_scalar
 
 
-    SUBROUTINE scalar_integral(value, field, part)
+    SUBROUTINE scalar_integral(value, field, part, volp_weight)
         USE MPI_f08, ONLY: MPI_Allreduce, MPI_SUM, MPI_COMM_WORLD
         REAL(realk), INTENT(out) :: value
         TYPE(field_t), INTENT(in) :: field
         INTEGER, INTENT(in), OPTIONAL :: part
+        LOGICAL, INTENT(in), OPTIONAL :: volp_weight
         REAL(realk), POINTER, CONTIGUOUS :: a(:, :, :), bt(:, :, :)
         REAL(realk), POINTER, CONTIGUOUS :: fine(:, :, :)
+        REAL(realk), POINTER, CONTIGUOUS :: volp(:, :, :)
         REAL(realk), POINTER, CONTIGUOUS :: dx(:), dy(:), dz(:)
-        REAL(realk) :: local, v
+        REAL(realk) :: local, v, weight
         INTEGER(intk) :: m, igrid, kk, jj, ii, k, j, i
+        LOGICAL :: use_volp
 
         local = 0.0_realk
+        use_volp = .FALSE.
+        IF (PRESENT(volp_weight)) use_volp = volp_weight
         DO m = 1, nmygrids
             igrid = mygrids(m)
             CALL get_mgdims(kk, jj, ii, igrid)
@@ -182,6 +211,7 @@ CONTAINS
             CALL get_fieldptr(dx, "DDX", igrid)
             CALL get_fieldptr(dy, "DDY", igrid)
             CALL get_fieldptr(dz, "DDZ", igrid)
+            IF (use_volp) CALL get_fieldptr(volp, "VOLP", igrid)
             DO i = 3, ii-2
                 DO j = 3, jj-2
                     DO k = 3, kk-2
@@ -190,8 +220,12 @@ CONTAINS
                             IF (part == 1) v = MAX(v, 0.0_realk)
                             IF (part == -1) v = MIN(v, 0.0_realk)
                         END IF
-                        local = local + v*bt(k, j, i) &
-                            *fine(k, j, i)*dx(i)*dy(j)*dz(k)
+                        IF (use_volp) THEN
+                            weight = volp(k, j, i)
+                        ELSE
+                            weight = bt(k, j, i)*dx(i)*dy(j)*dz(k)
+                        END IF
+                        local = local + v*weight*fine(k, j, i)
                     END DO
                 END DO
             END DO

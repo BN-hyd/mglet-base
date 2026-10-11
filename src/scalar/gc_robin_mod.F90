@@ -1,6 +1,7 @@
 MODULE gc_robin_mod
     USE core_mod
     USE ib_mod, ONLY: gc_t, wmindexlistn, wmcheckneighbor, choosestencil
+    USE ibconst_mod, ONLY: maccur
     USE scacore_mod, ONLY: scalar, scalar_t, nsca
     USE flow_mod, ONLY: gmol, rho
     USE robin_wall_mod, ONLY: robin_wall
@@ -30,6 +31,7 @@ CONTAINS
         INTEGER(intk) :: m, igrid, kk, jj, ii, ip3, ipp, ncells
         INTEGER(intk) :: bconds(6)
         REAL(realk), POINTER, CONTIGUOUS :: bp(:, :, :), bt(:, :, :)
+        REAL(realk), POINTER, CONTIGUOUS :: fine(:, :, :)
         REAL(realk), POINTER, CONTIGUOUS :: x(:), y(:), z(:)
         REAL(realk), POINTER, CONTIGUOUS :: dx(:), dy(:), dz(:)
 
@@ -42,6 +44,7 @@ CONTAINS
             CALL get_mgbasb(bconds, igrid)
             CALL get_fieldptr(bp, "BP", igrid)
             CALL get_fieldptr(bt, "BT", igrid)
+            CALL get_fieldptr(fine, "FINECELL", igrid)
             CALL get_fieldptr(x, "X", igrid)
             CALL get_fieldptr(y, "Y", igrid)
             CALL get_fieldptr(z, "Z", igrid)
@@ -50,37 +53,46 @@ CONTAINS
             CALL get_fieldptr(dz, "DDZ", igrid)
             ipp = gc%icellspointer(igrid)
             ncells = gc%icells(igrid)
-            CALL create_grid(grids(m), kk, jj, ii, bp, bt, x, y, z, &
+            CALL create_grid(grids(m), kk, jj, ii, bp, bt, fine, x, y, z, &
                 dx, dy, dz, bconds, gc%bzelltyp(ip3:ip3+kk*jj*ii-1), &
                 gc%nvecs(:, ipp:ipp+ncells-1), &
                 gc%arealist(ipp:ipp+ncells-1), &
                 gc%bodyid(ipp:ipp+ncells-1), &
+                gc%xpsw(:, ipp:ipp+ncells-1), &
                 gc%ucell(:, ipp:ipp+ncells-1))
         END DO
     END SUBROUTINE create_robin
 
 
-    SUBROUTINE create_grid(grid, kk, jj, ii, bp, bt, x, y, z, dx, dy, &
-            dz, bconds, bzelltyp, nvecs, areas, bodies, velocity)
+    SUBROUTINE create_grid(grid, kk, jj, ii, bp, bt, fine, x, y, z, dx, dy, &
+            dz, bconds, bzelltyp, nvecs, areas, bodies, surface, velocity)
         TYPE(robin_grid_t), INTENT(out) :: grid
         INTEGER(intk), INTENT(in) :: kk, jj, ii, bconds(6)
         REAL(realk), INTENT(in) :: bp(kk, jj, ii), bt(kk, jj, ii)
+        REAL(realk), INTENT(in) :: fine(kk, jj, ii)
         REAL(realk), INTENT(in) :: x(ii), y(jj), z(kk)
         REAL(realk), INTENT(in) :: dx(ii), dy(jj), dz(kk)
         INTEGER(intk), INTENT(in) :: bzelltyp(kk, jj, ii), bodies(:)
         REAL(realk), INTENT(in) :: nvecs(:, :), areas(:), velocity(:, :)
+        REAL(realk), INTENT(in) :: surface(:, :)
         TYPE(robin_patch_t), ALLOCATABLE :: work(:)
         INTEGER(intk) :: i, j, k, idx, body, p, l, n, count, chosen
         INTEGER(intk) :: ni(122), nj(122), nk(122), nn
         INTEGER(intk) :: si(122), sj(122), sk(122), nstc, fallback
+        INTEGER(intk) :: transferred, it, jt, kt, idx2
+        INTEGER(intk) :: normal_rescued, zero_area
         INTEGER(intk) :: ai(122), aj(122), ak(122), nearest
         REAL(realk) :: d, dc, ds(7), norm, radius, best
+        REAL(realk) :: wall_normal(4), cartarea, neighbor_norm
         LOGICAL :: reactive
 
         ALLOCATE(work(SIZE(areas)))
         CALL wmindexlistn(ni, nj, nk, nn)
         count = 0
         fallback = 0
+        transferred = 0
+        normal_rescued = 0
+        zero_area = 0
         grid%diffusion_rate = 4.0_realk * &
             (1.0_realk/MINVAL(dx(3:ii-2))**2 &
             + 1.0_realk/MINVAL(dy(3:jj-2))**2 &
@@ -91,7 +103,8 @@ CONTAINS
                     IF (bzelltyp(k, j, i) >= 0) CYCLE
                     idx = -bzelltyp(k, j, i)
                     body = bodies(idx)
-                    IF (body <= 0) THEN
+                    IF (body <= 0 .OR. &
+                            body > SIZE(scalar(1)%geometries)) THEN
                         WRITE(*, *) "Robin: unresolved surface body id"
                         CALL errr(__FILE__, __LINE__)
                     END IF
@@ -106,15 +119,95 @@ CONTAINS
                         WRITE(*, *) "Robin supports stationary walls only"
                         CALL errr(__FILE__, __LINE__)
                     END IF
-                    IF (ABS(areas(idx)) < TINY(1.0_realk)) CYCLE
-                    norm = SQRT(SUM(nvecs(1:3, idx)**2))
-                    IF (.NOT. ALL(ieee_is_finite(nvecs(:, idx))) .OR. &
-                            .NOT. ieee_is_finite(norm) .OR. &
-                            ABS(norm - 1.0_realk) > 1.0e-4_realk .OR. &
-                            .NOT. ieee_is_finite(areas(idx)) .OR. &
-                            areas(idx) < 0.0_realk .OR. &
-                            bt(k, j, i) < 0.5_realk) THEN
+                    IF (.NOT. ieee_is_finite(areas(idx)) .OR. &
+                            areas(idx) < 0.0_realk) THEN
+                        WRITE(*, *) "Robin: invalid patch area", &
+                            k, j, i, areas(idx)
+                        CALL errr(__FILE__, __LINE__)
+                    END IF
+                    ! An exactly zero-measure GC patch has no absorption.
+                    ! Retain every positive area, including tiny patches.
+                    IF (areas(idx) <= 0.0_realk) THEN
+                        zero_area = zero_area + 1
+                        CYCLE
+                    END IF
+                    wall_normal = nvecs(:, idx)
+                    IF (.NOT. ALL(ieee_is_finite(wall_normal)) .OR. &
+                            .NOT. ALL(ieee_is_finite(surface(:, idx)))) THEN
+                        WRITE(*, *) "Robin: nonfinite patch geometry", &
+                            k, j, i, wall_normal, surface(:, idx)
+                        CALL errr(__FILE__, __LINE__)
+                    END IF
+                    ! Reject corrupt large components before squaring so
+                    ! debug floating-point traps do not hide the diagnosis.
+                    norm = MAXVAL(ABS(wall_normal(1:3)))
+                    IF (norm > 2.0_realk) THEN
+                        WRITE(*, *) "Robin: invalid patch normal", &
+                            k, j, i, wall_normal
+                        CALL errr(__FILE__, __LINE__)
+                    END IF
+                    norm = SQRT(SUM(wall_normal(1:3)**2))
+                    cartarea = (dx(i)*dy(j) + dx(i)*dz(k) &
+                        + dy(j)*dz(k))/3.0_realk
+                    ! calc_nvecs_grid deliberately zeroes GC normals below
+                    ! this area threshold. Recover only that degeneracy,
+                    ! from an existing nearby normal on the same body.
+                    IF (norm < TINY(norm) .AND. &
+                            areas(idx)/cartarea < maccur**2) THEN
+                        nearest = 0
+                        best = HUGE(best)
+                        DO n = 1, nn
+                            it = i + ni(n)
+                            jt = j + nj(n)
+                            kt = k + nk(n)
+                            ! GC normals are computed on indices 2:dims.
+                            IF (it < 2 .OR. it > ii .OR. &
+                                    jt < 2 .OR. jt > jj .OR. &
+                                    kt < 2 .OR. kt > kk) CYCLE
+                            IF (bzelltyp(kt, jt, it) >= 0) CYCLE
+                            idx2 = -bzelltyp(kt, jt, it)
+                            IF (bodies(idx2) /= body) CYCLE
+                            IF (.NOT. ALL(ieee_is_finite(nvecs(:, idx2)))) CYCLE
+                            IF (.NOT. ALL(ieee_is_finite( &
+                                    surface(:, idx2)))) CYCLE
+                            IF (MAXVAL(ABS(nvecs(1:3, idx2))) > 2.0_realk) CYCLE
+                            neighbor_norm = SQRT(SUM(nvecs(1:3, idx2)**2))
+                            IF (ABS(neighbor_norm - 1.0_realk) &
+                                    > 1.0e-4_realk) CYCLE
+                            radius = SUM((surface(:, idx2)-surface(:, idx))**2)
+                            IF (radius < best) THEN
+                                nearest = idx2
+                                best = radius
+                            END IF
+                        END DO
+                        IF (nearest == 0) THEN
+                            WRITE(*, *) &
+                                "Robin: no neighboring unit GC normal", &
+                                k, j, i, body, areas(idx)
+                            CALL errr(__FILE__, __LINE__)
+                        END IF
+                        wall_normal(1:3) = nvecs(1:3, nearest)
+                        wall_normal(4) = DOT_PRODUCT(wall_normal(1:3), &
+                            surface(:, idx))
+                        norm = SQRT(SUM(wall_normal(1:3)**2))
+                        normal_rescued = normal_rescued + 1
+                    END IF
+                    IF (ABS(norm - 1.0_realk) > 1.0e-4_realk) THEN
                         WRITE(*, *) "Robin: invalid/unresolved patch", k, j, i
+                        WRITE(*, *) "Robin geometry body BP BT area normal", &
+                            body, bp(k, j, i), bt(k, j, i), areas(idx), &
+                            wall_normal
+                        WRITE(*, *) "Robin patch center", x(i), y(j), z(k)
+                        CALL wmcheckneighbor(k, j, i, kk, jj, ii, bp, &
+                            bconds, nn, ni, nj, nk, si, sj, sk, nstc)
+                        WRITE(*, *) "Robin eligible BP observations", nstc
+                        DO n = 1, nstc
+                            d = DOT_PRODUCT(wall_normal(1:3), &
+                                [x(si(n)), y(sj(n)), z(sk(n))]) &
+                                - wall_normal(4)
+                            WRITE(*, *) "Robin observation k j i distance", &
+                                sk(n), sj(n), si(n), d
+                        END DO
                         CALL errr(__FILE__, __LINE__)
                     END IF
                     count = count + 1
@@ -126,8 +219,8 @@ CONTAINS
                     work(count)%weight = 0.0_realk
                     ds = 0.0_realk
                     p = 0
-                    dc = DOT_PRODUCT(nvecs(1:3, idx), [x(i), y(j), z(k)]) &
-                        - nvecs(4, idx)
+                    dc = DOT_PRODUCT(wall_normal(1:3), [x(i), y(j), z(k)]) &
+                        - wall_normal(4)
                     si = 0
                     sj = 0
                     sk = 0
@@ -145,8 +238,8 @@ CONTAINS
                         ds(p) = dc
                     END IF
                     DO n = 1, chosen
-                        d = DOT_PRODUCT(nvecs(1:3, idx), &
-                            [x(si(n)), y(sj(n)), z(sk(n))]) - nvecs(4, idx)
+                        d = DOT_PRODUCT(wall_normal(1:3), &
+                            [x(si(n)), y(sj(n)), z(sk(n))]) - wall_normal(4)
                         IF (d <= MAX(TINY(d), 0.2_realk*ABS(dc))) CYCLE
                         p = p + 1
                         work(count)%point(:, p) = [sk(n), sj(n), si(n)]
@@ -158,9 +251,22 @@ CONTAINS
                         nearest = 0
                         best = HUGE(best)
                         DO n = 1, nstc
-                            d = DOT_PRODUCT(nvecs(1:3, idx), &
+                            ! BT=0 corner patches need an owned receiver
+                            ! with the same leaf/covered-grid membership.
+                            IF (bt(k, j, i) < 0.5_realk) THEN
+                                it = ai(n)
+                                jt = aj(n)
+                                kt = ak(n)
+                                IF (it < 3 .OR. it > ii-2 .OR. &
+                                        jt < 3 .OR. jt > jj-2 .OR. &
+                                        kt < 3 .OR. kt > kk-2) CYCLE
+                                IF (bt(kt, jt, it) < 0.5_realk .OR. &
+                                        NINT(fine(kt, jt, it)) /= &
+                                        NINT(fine(k, j, i))) CYCLE
+                            END IF
+                            d = DOT_PRODUCT(wall_normal(1:3), &
                                 [x(ai(n)), y(aj(n)), z(ak(n))]) &
-                                - nvecs(4, idx)
+                                - wall_normal(4)
                             IF (d <= MAX(TINY(d), &
                                     0.2_realk*ABS(dc))) CYCLE
                             radius = (x(ai(n))-x(i))**2 &
@@ -179,6 +285,18 @@ CONTAINS
                         n = nearest
                         work(count)%point(:, 1) = [ak(n), aj(n), ai(n)]
                         fallback = fallback + 1
+                    END IF
+                    ! A corner-only GC intersection can have BT=0 and no
+                    ! BP-open face neighbor. Retain its full area and wall
+                    ! plane, and apply its one-point flux to that same
+                    ! fluid observation instead of a masked unknown.
+                    IF (bt(k, j, i) < 0.5_realk) THEN
+                        kt = work(count)%point(1, 1)
+                        jt = work(count)%point(2, 1)
+                        it = work(count)%point(3, 1)
+                        work(count)%owner = [kt, jt, it]
+                        work(count)%volume = dx(it)*dy(jt)*dz(kt)
+                        transferred = transferred + 1
                     END IF
                     work(count)%n = p
                     ! Normalize before squaring to avoid scale dependence.
@@ -207,27 +325,49 @@ CONTAINS
             WRITE(*, *) "Robin one-point fallback patches on rank", &
                 myid, ":", fallback
         END IF
+        IF (transferred > 0) THEN
+            WRITE(*, *) "Robin corner-patch flux transfers on rank", &
+                myid, ":", transferred
+        END IF
+        IF (normal_rescued > 0) THEN
+            WRITE(*, *) "Robin neighboring-GC normal rescues on rank", &
+                myid, ":", normal_rescued
+        END IF
+        IF (zero_area > 0) THEN
+            WRITE(*, *) "Robin zero-measure GC patches on rank", &
+                myid, ":", zero_area
+        END IF
     END SUBROUTINE create_grid
 
 
-    SUBROUTINE apply_robin(qtt, reaction, t, sca, dt, rkfactor)
+    SUBROUTINE apply_robin(qtt, reaction, surface_rates, t, sca, dt, &
+            rkfactor)
+        USE MPI_f08, ONLY: MPI_Allreduce, MPI_SUM, MPI_COMM_WORLD
         TYPE(field_t), INTENT(inout) :: qtt, reaction
+        REAL(realk), INTENT(out) :: surface_rates(2)
         TYPE(field_t), INTENT(in) :: t
         TYPE(scalar_t), INTENT(in) :: sca
         REAL(realk), INTENT(in) :: dt, rkfactor
         REAL(realk), POINTER, CONTIGUOUS :: c(:, :, :), rhs(:, :, :)
         REAL(realk), POINTER, CONTIGUOUS :: rate(:, :, :)
+        REAL(realk), POINTER, CONTIGUOUS :: fine(:, :, :)
+        REAL(realk), ALLOCATABLE :: stiffness(:, :, :)
         INTEGER(intk) :: m, igrid, p, n, k, j, i, body
         REAL(realk) :: cbar, cwall, jout, conductance, diffusivity, bound
+        REAL(realk) :: local_rates(2), flux
         TYPE(robin_patch_t) :: patch
 
         reaction%arr = 0.0_realk
+        local_rates = 0.0_realk
         diffusivity = gmol/rho/sca%prmol
         DO m = 1, nmygrids
             igrid = mygrids(m)
             CALL t%get_ptr(c, igrid)
             CALL qtt%get_ptr(rhs, igrid)
             CALL reaction%get_ptr(rate, igrid)
+            CALL get_fieldptr(fine, "FINECELL", igrid)
+            ALLOCATE(stiffness(SIZE(c, 1), SIZE(c, 2), SIZE(c, 3)))
+            stiffness = 0.0_realk
             DO p = 1, SIZE(grids(m)%patch)
                 patch = grids(m)%patch(p)
                 body = patch%body
@@ -242,23 +382,35 @@ CONTAINS
                 CALL robin_wall(cwall, jout, conductance, cbar, &
                     patch%ell, diffusivity, sca%geometries(body)%k_s, &
                     sca%geometries(body)%c_eq)
-                ! Screen stiffness on every stage, including adaptive dt.
-                ! This is a row-norm bound, not a positivity guarantee for
-                ! this nonlocal stencil or for centered advection.
-                bound = diffusivity*grids(m)%diffusion_rate &
-                    + patch%area/patch%volume*conductance
-                IF (dt*rkfactor*bound > 0.5_realk) THEN
-                    WRITE(*, *) "Robin explicit dt too large; use dt <=", &
-                        0.5_realk/(rkfactor*bound)
-                    CALL errr(__FILE__, __LINE__)
-                END IF
                 k = patch%owner(1)
                 j = patch%owner(2)
                 i = patch%owner(3)
-                rate(k, j, i) = patch%area/patch%volume*jout
-                rhs(k, j, i) = rhs(k, j, i) - rate(k, j, i)
+                flux = patch%area*jout
+                rate(k, j, i) = rate(k, j, i) + flux/patch%volume
+                rhs(k, j, i) = rhs(k, j, i) - flux/patch%volume
+                stiffness(k, j, i) = stiffness(k, j, i) &
+                    + patch%area/patch%volume*conductance
+                ! Split signs per patch before shared receivers cancel.
+                local_rates(1) = local_rates(1) &
+                    + MAX(flux, 0.0_realk)*fine(k, j, i)
+                local_rates(2) = local_rates(2) &
+                    + MIN(flux, 0.0_realk)*fine(k, j, i)
             END DO
+            ! Screen the complete sink row on every RK stage, including
+            ! adaptive dt. Multiple patches may use the same receiver.
+            ! This bound does not guarantee nonlocal-stencil positivity.
+            bound = diffusivity*grids(m)%diffusion_rate &
+                + MAXVAL(stiffness)
+            IF (MAXVAL(stiffness) > 0.0_realk .AND. &
+                    dt*rkfactor*bound > 0.5_realk) THEN
+                WRITE(*, *) "Robin explicit dt too large; use dt <=", &
+                    0.5_realk/(rkfactor*bound)
+                CALL errr(__FILE__, __LINE__)
+            END IF
+            DEALLOCATE(stiffness)
         END DO
+        CALL MPI_Allreduce(local_rates, surface_rates, 2, mglet_mpi_real, &
+            MPI_SUM, MPI_COMM_WORLD)
     END SUBROUTINE apply_robin
 
 

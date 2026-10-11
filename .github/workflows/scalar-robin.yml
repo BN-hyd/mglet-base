@@ -49,3 +49,5 @@ jobs:
           path: |
             build/tests/Testing/Temporary/LastTest.log
             build/tests/ScalarRobin/runs/*/solver.log
+            build/tests/ScalarRobin/runs/*/validation.json
+            build/tests/ScalarRobin/runs/*-validation.json

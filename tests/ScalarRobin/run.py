@@ -8,6 +8,7 @@ import copy
 import json
 import math
 import os
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -78,11 +79,17 @@ def stl(path, triangles):
         f.write('endsolid wall\n')
 
 
-def split_grid(path, n=12):
-    """Two connected blocks; the reactive plane crosses their MPI interface."""
+def split_grid(path, n=12, spherical=False):
+    """Two connected y-blocks with reactive surfaces at their interface."""
     temporary = [path.with_name(f'grid-part-{i}.h5') for i in range(2)]
     for i, name in enumerate(temporary):
-        grid(name, (n, 4, 4), [(-.23, 1.), (.2*i, .2*(i+1)), (0., .4)], [1.])
+        if spherical:
+            require(n % 2 == 0, 'sphere split requires an even cell count')
+            grid(name, (n, n//2, n), [(-1.6, 1.6),
+                 (-1.6+1.6*i, 1.6*i), (-1.6, 1.6)], [0.])
+        else:
+            grid(name, (n, 4, 4),
+                 [(-.23, 1.), (.2*i, .2*(i+1)), (0., .4)], [1.])
     with h5py.File(temporary[0]) as f0, h5py.File(temporary[1]) as f1:
         with h5py.File(path, 'w') as f:
             infos = np.concatenate([f0['GRIDINFO'][:], f1['GRIDINFO'][:]])
@@ -203,7 +210,7 @@ def planar(directory, n=24, specs=((1., 1., .2, 1.),),
     return config, coords, exact, fluxes
 
 
-def shell(directory, n):
+def shell(directory, n, duration=.15, dt_scale=1.):
     directory.mkdir(parents=True, exist_ok=True)
     coords = grid(directory/'grids.h5', (n, n, n), [(-1.6, 1.6)]*3, [0.])
     # Independent analytic finite shell: Robin on BOTH concentric spheres.
@@ -212,7 +219,8 @@ def shell(directory, n):
     coeff = q/(4*math.pi)
     expression = (f'{coeff/(ki*a*a)+coeff/(diff*a):.17g}'
                   f'-{coeff/diff:.17g}/max(sqrt(x*x+y*y+z*z),0.01)')
-    subdivisions = 3 if n <= 16 else 4
+    # Hold the resolved STL fixed to isolate Cartesian mesh refinement.
+    subdivisions = 4
     sphere(directory/'inner.stl', a, subdivisions)
     sphere(directory/'outer.stl', b, subdivisions, inward=True)
     scalar = {'name': 'C0', 'prmol': 1., 'initial_value': expression,
@@ -221,8 +229,7 @@ def shell(directory, n):
                                          'c_eq': 0.},
                              'outer.stl': {'type': 'robin', 'k_s': ko,
                                          'c_eq': 1.}}}
-    duration = .15
-    steps = math.ceil(duration/(.01*(3.2/n)**2))
+    steps = math.ceil(duration/(.01*(3.2/n)**2*dt_scale))
     config = parameters([scalar], duration/steps, steps, spherical=True)
     (directory/'parameters.json').write_text(json.dumps(config, indent=2))
     return config, coords, q
@@ -281,7 +288,8 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
         return None, None
     require(result.returncode == 0, f'{directory}: solver failed\n{output[-4500:]}')
     require('SOLUTION EXPLODED' not in output, f'{directory}: exploded')
-    budgets, rates = {}, {}
+    budgets, rates, volp_budgets = {}, {}, {}
+    budget_steps, volp_steps = {}, {}
     for line in output.splitlines():
         p = line.split()
         if p and p[0] == 'ROBIN_BUDGET':
@@ -295,28 +303,96 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
                 require(abs(values[3]) < 2.e-12*scale,
                         'closed fluid region has nonzero external supply')
             budgets[p[1]] = values
+            budget_steps[p[1], int(p[2])] = values
+        if p and p[0] == 'ROBIN_VOLP_POINT_BUDGET':
+            values = np.array([float(v) for v in p[3:]])
+            require(np.isfinite(values).all(), 'nonfinite VOLP point budget')
+            volp_budgets[p[1]] = values
+            volp_steps[p[1], int(p[2])] = values
         if p and p[0] == 'ROBIN_RATE':
             rates[p[1]] = [float(v) for v in p[3:]]
+            require(np.isfinite(rates[p[1]]).all(), 'nonfinite surface rate')
     config = json.loads((directory/'parameters.json').read_text())
     for scalar in config['scalar']['scalars']:
         if any(bc['type'] == 'robin' for bc in scalar['geometries'].values()):
             require(scalar['name'] in budgets, 'missing Robin budget')
+            require(scalar['name'] in volp_budgets,
+                    'missing VOLP point budget')
+    require(budget_steps.keys() == volp_steps.keys(),
+            'BT and VOLP diagnostics have different steps')
+    for key, values in volp_steps.items():
+        bt_values = budget_steps[key]
+        scale = max(1., abs(values[1]), abs(bt_values[1]))
+        require(np.max(np.abs(values[[0, 3, 4]]-bt_values[[0, 3, 4]]))
+                < 2.e-12*scale, 'VOLP diagnostic changed integrated fluxes')
+        require(abs(values[-1]-(values[2]-bt_values[2]+bt_values[-1]))
+                < 2.e-12*scale, 'BT/VOLP storage residual identity failed')
     fields = {}
     with h5py.File(directory/'grids.h5', 'r') as mesh:
         info = mesh['GRIDINFO'][:]
     with h5py.File(directory/'fields.h5', 'r') as f:
-        for scalar in config['scalar']['scalars']:
-            name = scalar['name']
-            # fieldio2 stores flattened, transposed (i-fastest) grid data.
+        def read_blocks(name):
+            # fieldio2 uses flattened, transposed (i-fastest) grid data.
             blocks = []
             for g in info:
                 row = f[f'VOLUMEFIELDS/{name}/LEVEL{g["LEVEL"]}'][
                     int(g['IGRIDLVL'])-1]
                 blocks.append(row[:int(g['II']*g['JJ']*g['KK'])].reshape(
                     int(g['KK']), int(g['JJ']), int(g['II'])).transpose(2, 1, 0))
+            return blocks
+
+        point_mass, fluid_volume = {}, None
+        # FINECELL is not stored in fields.h5. At a single level all
+        # interior cells are leaves; do not guess multilevel coverage.
+        if volp_budgets and len(set(info['LEVEL'])) == 1:
+            volumes = read_blocks('VOLP')
+            fluid_volume = float(sum(np.sum(v[2:-2, 2:-2, 2:-2])
+                                     for v in volumes))
+        for scalar in config['scalar']['scalars']:
+            name = scalar['name']
+            blocks = read_blocks(name)
             fields[name] = np.asarray(blocks).squeeze()
             require(np.isfinite(fields[name]).all(), 'nonfinite concentration')
+            if name in volp_budgets and fluid_volume is not None:
+                mass = float(sum(np.sum(c[2:-2, 2:-2, 2:-2]
+                                        * v[2:-2, 2:-2, 2:-2])
+                                 for c, v in zip(blocks, volumes)))
+                require(abs(mass-volp_budgets[name][1])
+                        < 2.e-12*max(1., abs(mass)),
+                        f'{directory}: HDF5 VOLP point mass disagrees: '
+                        f'{mass}, {volp_budgets[name][1]}')
+                point_mass[name] = mass
+    max_bt_residual = max((abs(v[-1]) for v in budget_steps.values()),
+                          default=0.)
+    max_volp_residual = max((abs(v[-1]) for v in volp_steps.values()),
+                            default=0.)
+    patch_diagnostics = {}
+    for key, label in (
+            ('one_point_fallbacks', 'one-point fallback patches'),
+            ('corner_transfers', 'corner-patch flux transfers'),
+            ('normal_rescues', 'neighboring-GC normal rescues'),
+            ('zero_measure_patches', 'zero-measure GC patches')):
+        matches = re.findall(r'Robin '+re.escape(label)
+                             + r' on rank\s+\d+\s*:\s*(\d+)', output)
+        patch_diagnostics[key] = sum(int(count) for count in matches)
+    report = {'rates': rates,
+              'budget': {k: v.tolist() for k, v in budgets.items()},
+              'volp_point_budget': {k: v.tolist()
+                                    for k, v in volp_budgets.items()},
+              'max_abs_bt_residual': float(max_bt_residual),
+              'max_abs_volp_point_residual': float(max_volp_residual),
+              'hdf5_volp_point_mass': point_mass,
+              'hdf5_fluid_volume': fluid_volume,
+              'patch_diagnostics': patch_diagnostics}
+    (directory/'validation.json').write_text(json.dumps(report, indent=2))
     print(f'{directory.name}: rates={rates}, budgets={budgets}', flush=True)
+    if volp_budgets:
+        print(f'{directory.name}: VOLP point mass={point_mass}, '
+              f'fluid volume={fluid_volume}, max step residual='
+              f'{max_volp_residual:.9g} (diagnostic, not forced to zero)',
+              flush=True)
+        print(f'{directory.name}: patch diagnostics={patch_diagnostics}',
+              flush=True)
     if directory.name.startswith('sphere') and budgets['C0'][1] <= 0.:
         raise AssertionError('Sphere has no fluid cells:\n'+output[:7000])
     return fields, rates
@@ -357,7 +433,9 @@ def main():
     if args.suite == 'all':
         failed = []
         for suite in ('planar', 'limits', 'isolation', 'legacy',
-                      'transient', 'sphere', 'multilevel', 'invalid'):
+                      'transient', 'sphere', 'sphere-time', 'sphere-steady',
+                      'sphere-mpi',
+                      'multilevel', 'invalid'):
             result = subprocess.run([sys.executable, __file__, '--solver',
                                      binary, '--work', str(root),
                                      '--suite', suite])
@@ -453,6 +531,14 @@ def run_suite(suite, binary, root):
             directory = root/f'sphere-{n}'
             _, _, reference = shell(directory, n)
             fields, rates = execute(binary, directory)
+            diagnostics = json.loads((directory/'validation.json').read_text())[
+                'patch_diagnostics']
+            if n == 16:
+                require(diagnostics['corner_transfers'] > 0,
+                        'N=16 sphere did not exercise corner-patch transfers')
+            if n == 32:
+                require(diagnostics['normal_rescues'] > 0,
+                        'N=32 sphere did not exercise tiny-patch normal rescue')
             uptake, release = rates['C0']
             error = abs(uptake/reference-1.)
             sphere_errors.append(error)
@@ -463,10 +549,116 @@ def run_suite(suite, binary, root):
         require(sphere_errors[-1] < .1 and sphere_errors[-1] < sphere_errors[0],
                 f'sphere refinement failed: {sphere_errors}')
         return
+    if suite == 'sphere-time':
+        # Curved-surface temporal refinement at fixed finest grid/STL.
+        # Printed rates are the last RK stage's rates, so rate agreement
+        # is checked absolutely; time order uses end-of-step fields.
+        solutions, stage_rates = [], []
+        n = 32
+        h = 3.2/n
+        for scale in (1., .5, .25):
+            directory = root/f'sphere-time-{scale}'
+            _, coords, reference = shell(directory, n, dt_scale=scale)
+            fields, rates = execute(binary, directory)
+            xyz = np.meshgrid(*(axis[2:-2] for axis in coords), indexing='ij')
+            radius = np.sqrt(sum(axis**2 for axis in xyz))
+            physical = (radius > .5+h) & (radius < 1.4-h)
+            solutions.append(fields['C0'][2:-2, 2:-2, 2:-2][physical])
+            stage_rates.append(np.asarray(rates['C0']))
+            require(abs(rates['C0'][0]/reference-1.) < .1,
+                    'time-refined sphere exceeds finest uptake criterion')
+            require(abs(rates['C0'][1]/reference+1.) < .25,
+                    'time-refined sphere exceeds supply criterion')
+        e1 = np.sqrt(np.mean((solutions[0]-solutions[1])**2))
+        e2 = np.sqrt(np.mean((solutions[1]-solutions[2])**2))
+        require(e2 < .3*e1 or max(e1, e2) < 1.e-11,
+                f'sphere RK field convergence failed: {e1}, {e2}')
+        rate_difference = max(np.max(np.abs(stage_rates[i]-stage_rates[i+1]))
+                              for i in (0, 1))
+        require(rate_difference < .001*reference,
+                f'sphere timestep changed uptake/release: {rate_difference}')
+        print(f'sphere RK refinement: physical field RMS differences '
+              f'{e1:.9g}, {e2:.9g}; max rate difference '
+              f'{rate_difference:.9g}', flush=True)
+        (root/'sphere-time-validation.json').write_text(json.dumps(
+            {'field_rms_differences': [float(e1), float(e2)],
+             'max_rate_difference': float(rate_difference),
+             'rates': [r.tolist() for r in stage_rates]}, indent=2))
+        return
+    if suite == 'sphere-mpi':
+        n = 16
+        single_directory = root/'sphere-mpi-single'
+        _, _, reference = shell(single_directory, n)
+        _, single_rates = execute(binary, single_directory)
+        directory = root/'sphere-mpi-split'
+        shell(directory, n)
+        split_grid(directory/'grids.h5', n=n, spherical=True)
+        serial, serial_rates = execute(binary, directory)
+        parallel, parallel_rates = execute(binary, directory, ranks=2)
+        difference = np.max(np.abs(serial['C0']-parallel['C0']))
+        require(difference < 2.e-11,
+                f'sphere MPI differs from the same serial blocks: {difference}')
+        for rates in (single_rates, serial_rates, parallel_rates):
+            require(abs(rates['C0'][0]/reference-1.) < .25,
+                    'MPI sphere exceeds uptake criterion')
+            require(abs(rates['C0'][1]/reference+1.) < .25,
+                    'MPI sphere exceeds supply criterion')
+        partition_delta = (np.asarray(serial_rates['C0'])
+                           - np.asarray(single_rates['C0']))
+        # Local fallback receivers may change with the block partition;
+        # report that spatial discretization effect separately from MPI.
+        print(f'sphere MPI N={n}: max same-block field difference '
+              f'{difference:.9g}; split-minus-single uptake/release '
+              f'{partition_delta.tolist()}', flush=True)
+        (root/'sphere-mpi-validation.json').write_text(json.dumps(
+            {'n': n, 'single_rates': single_rates['C0'],
+             'serial_split_rates': serial_rates['C0'],
+             'parallel_split_rates': parallel_rates['C0'],
+             'max_same_blocks_field_difference': float(difference),
+             'split_minus_single_rate': partition_delta.tolist()}, indent=2))
+        return
+    if suite == 'sphere-steady':
+        # Continue one finest-grid solution to t=.6 and t=1.2. Keeping dt
+        # fixed separates relaxation from timestep differences, and each
+        # subprocess remains individually subject to the runtime limit.
+        directory = root/'sphere-steady'
+        config, _, reference = shell(directory, 32)
+        measured = []
+        for time in (.15, .6, 1.2):
+            if measured:
+                previous_time = (.15, .6)[len(measured)-1]
+                config['time'].update({'read': True, 'continue': True,
+                                      'mtstep': round((time-previous_time)
+                                                      /config['time']['dt'])})
+                config['ib']['blocking'] = 'useblock'
+            _, rates = execute(binary, directory, config)
+            measured.append(np.asarray(rates['C0']))
+            print(f'sphere relaxation t={time}: '
+                  f'uptake={rates["C0"][0]:.9g}, '
+                  f'release={rates["C0"][1]:.9g}', flush=True)
+        increment = np.max(np.abs(measured[-1]-measured[-2]))
+        imbalance = abs(sum(measured[-1]))
+        require(increment < .01*reference,
+                f'sphere rate not steady within 1% Q: {increment}')
+        require(imbalance < .01*reference,
+                f'sphere steady supply/loss imbalance exceeds 1% Q: {imbalance}')
+        require(abs(measured[-1][0]/reference-1.) < .1,
+                'relaxed sphere exceeds finest uptake criterion')
+        require(abs(measured[-1][1]/reference+1.) < .25,
+                'relaxed sphere exceeds supply criterion')
+        print(f'sphere steady rate increment {increment:.9g}; '
+              f'supply/loss imbalance {imbalance:.9g}', flush=True)
+        (root/'sphere-steady-validation.json').write_text(json.dumps(
+            {'times': [.15, .6, 1.2],
+             'rates': [r.tolist() for r in measured],
+             'last_rate_increment': float(increment),
+             'last_supply_loss_imbalance': float(imbalance)}, indent=2))
+        return
     if suite == 'invalid':
         for key, bad, message in [('k_s', -1., 'k_s must be finite'),
-                                  ('prmol', 0., 'positive finite prmol')]:
-            directory = root/f'invalid-{key}'
+                                  ('prmol', 0., 'positive finite prmol'),
+                                  ('prmol', -1., 'positive finite prmol')]:
+            directory = root/f'invalid-{key}-{bad}'
             config, _, _, _ = planar(directory)
             scalar = config['scalar']['scalars'][0]
             if key == 'prmol':
@@ -474,6 +666,39 @@ def run_suite(suite, binary, root):
             else:
                 scalar['geometries']['wall.stl'][key] = bad
             execute(binary, directory, config, expect_failure=message)
+        # Existing flow initialization rejects these properties before
+        # scalar initialization computes gmol/rho/prmol. In particular
+        # two negative inputs must not produce a valid diffusivity.
+        for key in ('gmol', 'rho'):
+            for bad in (0., -1.):
+                directory = root/f'invalid-{key}-{bad}'
+                config, _, _, _ = planar(directory)
+                config['flow'][key] = bad
+                execute(binary, directory, config,
+                        expect_failure=('Viscosity must be positive'
+                                        if key == 'gmol' else
+                                        'Density must be positive'))
+        directory = root/'invalid-negative-gmol-rho'
+        config, _, _, _ = planar(directory)
+        config['flow'].update({'gmol': -1., 'rho': -1.})
+        execute(binary, directory, config,
+                expect_failure='Viscosity must be positive')
+        # JSON cannot represent NaN or infinity. The input parser must
+        # reject these nonstandard tokens before scalar initialization.
+        for name, bad in (('nan', float('nan')), ('inf', float('inf'))):
+            directory = root/f'invalid-c_eq-{name}'
+            config, _, _, _ = planar(directory)
+            config['scalar']['scalars'][0]['geometries']['wall.stl'][
+                'c_eq'] = bad
+            execute(binary, directory, config, expect_failure='JSON error:')
+        # An unsafe explicit step must stop, including the diffusion-limited
+        # strong-rate regime, instead of repairing the result by clipping.
+        directory = root/'invalid-strong-dt'
+        config, _, _, _ = planar(directory,
+                                  specs=((1., 1.e12, .2, 1.),))
+        config['time'].update({'dt': 1., 'mtstep': 1})
+        execute(binary, directory, config,
+                expect_failure='Robin explicit dt too large')
         return
     if suite == 'multilevel':
         for equilibrium in (True, False):
