@@ -6,9 +6,13 @@ MODULE timeintegrate_scalar_mod
     USE bound_scalar_mod
     USE itinfo_scalar_mod
     USE gc_scastencils_mod
+    USE gc_robin_mod, ONLY: apply_robin
 
     IMPLICIT NONE(type, external)
     PRIVATE
+
+    REAL(realk), ALLOCATABLE :: robin_mass0(:), robin_amount(:, :)
+    REAL(realk), ALLOCATABLE :: robin_accum(:, :)
 
     PUBLIC :: timeintegrate_scalar, itinfo_scalar
 
@@ -24,19 +28,25 @@ CONTAINS
 
         ! Local variables
         INTEGER(intk) :: ilevel, l
-        REAL(realk) :: frhs, fu, dtrk, dtrki
+        REAL(realk) :: frhs, fu, dtrk, dtrki, budget(2), mass, residual
         TYPE(field_t), POINTER :: t, told, dt_f
-        TYPE(field_t) :: qtt, qtu, qtv, qtw
+        TYPE(field_t) :: qtt, qtu, qtv, qtw, reaction
 
         IF (.NOT. solve_scalar) RETURN
         CALL start_timer(400)
         CALL start_timer(401)
+        IF (ANY(scalar%robin_budget) .AND. &
+                .NOT. ALLOCATED(robin_mass0)) THEN
+            ALLOCATE(robin_mass0(nsca), robin_amount(2, nsca), &
+                robin_accum(2, nsca))
+        END IF
 
         ! Local temporary storage ("scrap")
         CALL qtt%init("QTT")
         CALL qtu%init("QTU", istag=1)
         CALL qtv%init("QTV", jstag=1)
         CALL qtw%init("QTW", kstag=1)
+        CALL reaction%init("SREACTION")
 
         CALL qtu%init_buffers()
         CALL qtv%init_buffers()
@@ -49,6 +59,12 @@ CONTAINS
             CALL get_field(t, scalar(l)%name)
             CALL get_field(dt_f, "D"//TRIM(scalar(l)%name))
             CALL get_field(told, TRIM(scalar(l)%name)//"_OLD")
+
+            IF (scalar(l)%robin_budget .AND. irk == 1) THEN
+                CALL scalar_integral(robin_mass0(l), t)
+                robin_amount(:, l) = 0.0_realk
+                robin_accum(:, l) = 0.0_realk
+            END IF
 
             ! Copy to "T_OLD" (not needed here but used for Boussinesq)
             told%arr = t%arr
@@ -74,9 +90,24 @@ CONTAINS
                 CALL set_scastencils("P", scalar(l), qtt=qtt)
             END IF
 
+            IF (scalar(l)%has_robin) THEN
+                CALL apply_robin(qtt, reaction, t, scalar(l), dt, &
+                    MAXVAL(ABS(rkscheme%b(1:rkscheme%nrk))))
+            END IF
+
             ! In IRK 1, FRHS is zero, therefore we do not need to zeroize
             ! the dt field before each step
             CALL rkscheme%get_coeffs(frhs, fu, dtrk, dtrki, irk)
+
+            IF (scalar(l)%robin_budget) THEN
+                CALL scalar_integral(budget(1), qtt)
+                CALL scalar_integral(budget(2), reaction)
+                ! qtt contains supply minus outward surface reaction.
+                budget(1) = budget(1) + budget(2)
+                robin_accum(:, l) = frhs*robin_accum(:, l) + budget
+                robin_amount(:, l) = robin_amount(:, l) &
+                    + dt*fu*robin_accum(:, l)
+            END IF
 
             ! dT_j = A_j*dT_(j-1) + QTT
             ! T_j = T_(j-1) + B_j*dT_j
@@ -97,6 +128,18 @@ CONTAINS
 
             CALL connect(layers=2, s1=t, corners=.TRUE.)
 
+            IF (scalar(l)%robin_budget .AND. irk == rkscheme%nrk) THEN
+                CALL scalar_integral(mass, t)
+                residual = mass - robin_mass0(l) - robin_amount(1, l) &
+                    + robin_amount(2, l)
+                IF (myid == 0) THEN
+                    WRITE(*, '(A, 1X, A, 1X, I0, 6(1X, ES24.16))') &
+                        "ROBIN_BUDGET", TRIM(scalar(l)%name), ittot, &
+                        timeph + dt, mass, mass - robin_mass0(l), &
+                        robin_amount(:, l), residual
+                END IF
+            END IF
+
             ! TODO: Fill ghost layers of T (maybe only at last IRK?)
         END DO
         CALL stop_timer(402)
@@ -105,9 +148,44 @@ CONTAINS
         CALL qtu%finish()
         CALL qtv%finish()
         CALL qtw%finish()
+        CALL reaction%finish()
 
         CALL stop_timer(400)
     END SUBROUTINE timeintegrate_scalar
+
+
+    SUBROUTINE scalar_integral(value, field)
+        USE MPI_f08, ONLY: MPI_Allreduce, MPI_SUM, MPI_COMM_WORLD
+        REAL(realk), INTENT(out) :: value
+        TYPE(field_t), INTENT(in) :: field
+        REAL(realk), POINTER, CONTIGUOUS :: a(:, :, :), bt(:, :, :)
+        REAL(realk), POINTER, CONTIGUOUS :: fine(:, :, :)
+        REAL(realk), POINTER, CONTIGUOUS :: dx(:), dy(:), dz(:)
+        REAL(realk) :: local
+        INTEGER(intk) :: m, igrid, kk, jj, ii, k, j, i
+
+        local = 0.0_realk
+        DO m = 1, nmygrids
+            igrid = mygrids(m)
+            CALL get_mgdims(kk, jj, ii, igrid)
+            CALL field%get_ptr(a, igrid)
+            CALL get_fieldptr(bt, "BT", igrid)
+            CALL get_fieldptr(fine, "FINECELL", igrid)
+            CALL get_fieldptr(dx, "DDX", igrid)
+            CALL get_fieldptr(dy, "DDY", igrid)
+            CALL get_fieldptr(dz, "DDZ", igrid)
+            DO i = 3, ii-2
+                DO j = 3, jj-2
+                    DO k = 3, kk-2
+                        local = local + a(k, j, i)*bt(k, j, i) &
+                            *fine(k, j, i)*dx(i)*dy(j)*dz(k)
+                    END DO
+                END DO
+            END DO
+        END DO
+        CALL MPI_Allreduce(local, value, 1, mglet_mpi_real, MPI_SUM, &
+            MPI_COMM_WORLD)
+    END SUBROUTINE scalar_integral
 
 
     SUBROUTINE itinfo_scalar(itstep, ittot, timeph, dt, exploded)

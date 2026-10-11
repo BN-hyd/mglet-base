@@ -1,5 +1,10 @@
 enable_testing()
 
+add_executable(robin_wall_test robin_wall_test.F90)
+target_link_libraries(robin_wall_test PRIVATE scalar)
+target_include_directories(robin_wall_test PRIVATE ${CMAKE_Fortran_MODULE_DIRECTORY})
+add_test(NAME ScalarRobinKernel COMMAND robin_wall_test)
+
 SUBDIRLIST(MGLET_TESTCASES ${CMAKE_CURRENT_SOURCE_DIR})
 FOREACH(test ${MGLET_TESTCASES})
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${test}/run.sh)

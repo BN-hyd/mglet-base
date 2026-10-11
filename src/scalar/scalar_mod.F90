@@ -14,6 +14,7 @@ CONTAINS
         USE itinfo_scalar_mod, ONLY: init_itinfo_scalar
         USE scastat_mod, ONLY: init_scastat
         USE gc_scastencils_mod
+        USE gc_robin_mod, ONLY: create_robin
         USE ib_mod
 
         CALL init_scacore()
@@ -38,6 +39,7 @@ CONTAINS
         TYPE IS (gc_t)
             IF (solve_scalar) THEN
                 CALL create_scastencils(ib)
+                CALL create_robin(ib)
             END IF
         END SELECT
     END SUBROUTINE init_scalar
@@ -46,12 +48,14 @@ CONTAINS
     SUBROUTINE finish_scalar
         USE itinfo_scalar_mod, ONLY: finish_itinfo_scalar
         USE scastat_mod, ONLY: finish_scastat
+        USE gc_robin_mod, ONLY: finish_robin
 
         IF (.NOT. has_scalar) RETURN
 
         CALL finish_scastat()
         CALL finish_itinfo_scalar()
         CALL finish_scacore()
+        CALL finish_robin()
     END SUBROUTINE finish_scalar
 
 

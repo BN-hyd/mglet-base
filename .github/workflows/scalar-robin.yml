@@ -1,0 +1,29 @@
+name: scalar-robin
+on:
+  push:
+    branches: ['feature/scalar-robin-surface-reaction*']
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/kmturbulenz/gnu-ompi-image:date-20260203
+      options: '--shm-size=2gb'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with runtime checks
+        shell: bash
+        run: |
+          source /opt/bashrc || true
+          cmake -S . -B build -GNinja --preset=gnu-debug -DMGLET_REAL64=ON
+          cmake --build build -j2
+      - name: Tests
+        shell: bash
+        env:
+          OMPI_ALLOW_RUN_AS_ROOT: '1'
+          OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: '1'
+        run: |
+          source /opt/bashrc || true
+          ctest --test-dir build/tests --output-on-failure --timeout 180

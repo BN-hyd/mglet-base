@@ -2,6 +2,8 @@ add_library(scalar STATIC
     blockbt_mod.F90
     bound_scalar_mod.F90
     gc_scastencils_mod.F90
+    gc_robin_mod.F90
+    robin_wall_mod.F90
     itinfo_scalar_mod.F90
     scacore_mod.F90
     scalar_mod.F90

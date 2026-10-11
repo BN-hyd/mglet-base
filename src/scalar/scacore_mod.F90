@@ -1,7 +1,8 @@
 MODULE scacore_mod
     USE core_mod
     USE ib_mod, ONLY: ib, gc_t
-    USE flow_mod, ONLY: has_flow
+    USE flow_mod, ONLY: has_flow, gmol, rho
+    USE, INTRINSIC :: ieee_arithmetic, ONLY: ieee_is_finite
 
     IMPLICIT NONE(type, external)
     PRIVATE
@@ -10,10 +11,13 @@ MODULE scacore_mod
         ! Integer flag corresponding to type of BC
         !   flag = 0: Fixed value (Diriclet) boundary condition ("value")
         !   flag = 1: Fixed flux (Neumann) boundary condition ("flux")
+        !   flag = 2: Finite-rate surface reaction ("robin")
         INTEGER(intk) :: flag
 
         ! Actual value or flux
         REAL(realk) :: value
+        REAL(realk) :: k_s = 0.0_realk ! length/time
+        REAL(realk) :: c_eq = 0.0_realk ! same units as the scalar
     END TYPE scalar_bc_t
 
     TYPE :: scalar_source_t
@@ -30,6 +34,8 @@ MODULE scacore_mod
         REAL(realk) :: prmol
         INTEGER(intk) :: units(7)
         INTEGER(intk) :: kayscrawford
+        LOGICAL :: has_robin = .FALSE.
+        LOGICAL :: robin_budget = .FALSE.
         TYPE(scalar_bc_t), ALLOCATABLE :: geometries(:)
         TYPE(scalar_source_t), ALLOCATABLE :: sources(:)
     CONTAINS
@@ -127,6 +133,9 @@ CONTAINS
                         itype = 0
                     CASE("flux")
                         itype = 1
+                    CASE("robin")
+                        itype = 2
+                        scalar(l)%has_robin = .TRUE.
                     CASE DEFAULT
                         WRITE(*, *) "Invalid type: ", type
                         CALL errr(__FILE__, __LINE__)
@@ -137,8 +146,42 @@ CONTAINS
                     jsonptr = "/geometries/" // TRIM(ib%stlnames(n)) // "/value"
                     CALL sc%get_value(jsonptr, rvalue, 0.0)
                     scalar(l)%geometries(n)%value = rvalue
+                    IF (itype == 2) THEN
+                        jsonptr = "/geometries/" // &
+                            TRIM(ib%stlnames(n)) // "/k_s"
+                        CALL sc%get_value(jsonptr, rvalue)
+                        IF (.NOT. ieee_is_finite(rvalue) .OR. &
+                                rvalue < 0.0_realk) THEN
+                            WRITE(*, *) "Robin k_s must be finite and >= 0"
+                            CALL errr(__FILE__, __LINE__)
+                        END IF
+                        scalar(l)%geometries(n)%k_s = rvalue
+                        jsonptr = "/geometries/" // &
+                            TRIM(ib%stlnames(n)) // "/c_eq"
+                        CALL sc%get_value(jsonptr, rvalue, 0.0_realk)
+                        IF (.NOT. ieee_is_finite(rvalue)) THEN
+                            WRITE(*, *) "Robin c_eq must be finite"
+                            CALL errr(__FILE__, __LINE__)
+                        END IF
+                        scalar(l)%geometries(n)%c_eq = rvalue
+                    END IF
                 END DO
             END SELECT
+
+            IF (scalar(l)%has_robin) THEN
+                IF (.NOT. ieee_is_finite(scalar(l)%prmol) .OR. &
+                        scalar(l)%prmol <= 0.0_realk) THEN
+                    WRITE(*, *) "Robin scalar requires positive finite prmol"
+                    CALL errr(__FILE__, __LINE__)
+                END IF
+                rvalue = gmol/rho/scalar(l)%prmol
+                IF (.NOT. ieee_is_finite(rvalue) .OR. rvalue <= 0.0_realk) THEN
+                    WRITE(*, *) "Robin scalar requires positive finite D"
+                    CALL errr(__FILE__, __LINE__)
+                END IF
+                CALL sc%get_value("/robin_budget", &
+                    scalar(l)%robin_budget, .FALSE.)
+            END IF
 
             ! Read source terms
             IF (sc%exists("/sources")) THEN
