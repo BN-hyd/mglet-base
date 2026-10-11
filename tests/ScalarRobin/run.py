@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import subprocess
+import sys
 
 import h5py
 import numpy as np
@@ -252,10 +253,17 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
         if any(bc['type'] == 'robin' for bc in scalar['geometries'].values()):
             require(scalar['name'] in budgets, 'missing Robin budget')
     fields = {}
+    with h5py.File(directory/'grids.h5', 'r') as mesh:
+        info = mesh['GRIDINFO'][:]
     with h5py.File(directory/'fields.h5', 'r') as f:
         for scalar in config['scalar']['scalars']:
             name = scalar['name']
-            fields[name] = f[name+'/LEVEL1'][...].squeeze()
+            # fieldio2 stores flattened, transposed (i-fastest) grid data.
+            raw = f['VOLUMEFIELDS/'+name+'/LEVEL1'][...]
+            blocks = [row[:int(g['II']*g['JJ']*g['KK'])].reshape(
+                int(g['KK']), int(g['JJ']), int(g['II'])).transpose(2, 1, 0)
+                for row, g in zip(raw, info)]
+            fields[name] = np.asarray(blocks).squeeze()
             require(np.isfinite(fields[name]).all(), 'nonfinite concentration')
     return fields, rates
 
@@ -282,6 +290,7 @@ def main():
     parser.add_argument('--solver')
     parser.add_argument('--generate', type=Path)
     parser.add_argument('--work', type=Path, default=Path('runs'))
+    parser.add_argument('--suite', default='all')
     args = parser.parse_args()
     if args.generate:
         planar(args.generate)
@@ -291,97 +300,127 @@ def main():
     binary = str(Path(args.solver).resolve())
     root = args.work.resolve()
     root.mkdir(parents=True, exist_ok=True)
-    for n in (12, 24, 48):
-        directory = root/f'plane-{n}'
-        _, _, exact, flux = planar(directory, n=n)
+    if args.suite == 'all':
+        failed = []
+        for suite in ('planar', 'limits', 'isolation', 'legacy',
+                      'transient', 'sphere', 'invalid'):
+            result = subprocess.run([sys.executable, __file__, '--solver',
+                                     binary, '--work', str(root),
+                                     '--suite', suite])
+            if result.returncode:
+                failed.append(suite)
+        require(not failed, f'Failed suites: {failed}')
+        print('Scalar Robin integration tests: PASS', flush=True)
+        return
+    run_suite(args.suite, binary, root)
+
+
+def run_suite(suite, binary, root):
+    if suite == 'planar':
+        for n in (12, 24, 48):
+            directory = root/f'plane-{n}'
+            _, _, exact, flux = planar(directory, n=n)
+            fields, rates = execute(binary, directory)
+            check_planar(fields, exact, rates, flux)
+        directory = root/'relax-to-steady'
+        _, _, exact, flux = planar(directory, n=12, initial=1., duration=5.)
+        fields, rates = execute(binary, directory)
+        check_planar(fields, exact, rates, flux, tolerance=4.e-3)
+        return
+    if suite == 'limits':
+        for name, spec in [('zero', (1., 0., .2, 1.)),
+                           ('strong', (1., 1.e12, .2, 1.)),
+                           ('equal', (1., 1., .2, .2)),
+                           ('reverse', (1., 2., .7, .1))]:
+            directory = root/name
+            _, _, exact, flux = planar(directory, specs=(spec,))
+            fields, rates = execute(binary, directory)
+            check_planar(fields, exact, rates, flux)
+        return
+    if suite == 'isolation':
+        specs = ((1., 1., .2, 1.), (.3, 2., .1, .8))
+        directory = root/'multiple'
+        _, _, exact, flux = planar(directory, specs=specs)
         fields, rates = execute(binary, directory)
         check_planar(fields, exact, rates, flux)
-    directory = root/'relax-to-steady'
-    _, _, exact, flux = planar(directory, n=12, initial=1., duration=5.)
-    fields, rates = execute(binary, directory)
-    check_planar(fields, exact, rates, flux, tolerance=4.e-3)
-    for name, spec in [('zero', (1., 0., .2, 1.)),
-                       ('strong', (1., 1.e12, .2, 1.)),
-                       ('equal', (1., 1., .2, .2)),
-                       ('reverse', (1., 2., .7, .1))]:
-        directory = root/name
-        _, _, exact, flux = planar(directory, specs=(spec,))
-        fields, rates = execute(binary, directory)
-        check_planar(fields, exact, rates, flux)
-    specs = ((1., 1., .2, 1.), (.3, 2., .1, .8))
-    directory = root/'multiple'
-    _, _, exact, flux = planar(directory, specs=specs)
-    fields, rates = execute(binary, directory)
-    check_planar(fields, exact, rates, flux)
-    for i, spec in enumerate(specs):
-        single = root/f'single-{i}'
-        planar(single, specs=(spec,))
-        isolated, _ = execute(binary, single)
-        require(np.max(np.abs(fields[f'C{i}']-isolated['C0'])) < 2.e-12,
-                'scalar parameter cross-contamination')
-    for kind in ('flux', 'value'):
-        directory = root/f'legacy-{kind}'
-        _, _, exact, flux = planar(directory, kind=kind,
-                                  specs=((1., 1.e12, .2, 1.),))
-        fields, _ = execute(binary, directory)
-        check_planar(fields, exact, None, flux, tolerance=.025)
-    # Time convergence from a nonsteady state, fixed mesh and final time.
-    solutions = []
-    for scale in (1., .5, .25):
-        directory = root/f'time-{scale}'
-        planar(directory, n=12, initial=1., duration=.05, dt_scale=scale)
-        fields, _ = execute(binary, directory)
-        solutions.append(fields['C0'])
-    e1 = np.linalg.norm(solutions[0]-solutions[1])
-    e2 = np.linalg.norm(solutions[1]-solutions[2])
-    require(e2 < .3*e1, f'RK time convergence failed: {e1}, {e2}')
-    print(f'RK refinement differences: {e1:.6g}, {e2:.6g}', flush=True)
-    # Restart and MPI use the same transient as an uninterrupted run.
-    directory = root/'restart'
-    config, _, _, _ = planar(directory, n=12, initial=1., duration=.05)
-    whole = copy.deepcopy(config)
-    first = copy.deepcopy(config)
-    first['time']['mtstep'] = whole['time']['mtstep']//2
-    execute(binary, directory, first)
-    second = copy.deepcopy(config)
-    second['time'].update({'read': True, 'continue': True,
-                          'mtstep': whole['time']['mtstep']-first['time']['mtstep']})
-    second['ib']['blocking'] = 'useblock'
-    resumed, _ = execute(binary, directory, second)
-    require(np.max(np.abs(resumed['C0']-solutions[0])) < 2.e-11,
-            'restart differs from uninterrupted integration')
-    directory = root/'mpi'
-    config, _, _, _ = planar(directory, n=12, initial=1., duration=.05)
-    split_grid(directory/'grids.h5')
-    serial_blocks, _ = execute(binary, directory)
-    parallel, _ = execute(binary, directory, ranks=2)
-    require(np.max(np.abs(parallel['C0']-serial_blocks['C0'])) < 2.e-11,
-            'MPI differs from serial')
-    sphere_errors = []
-    for n in (16, 24, 32):
-        directory = root/f'sphere-{n}'
-        _, _, reference = shell(directory, n)
-        fields, rates = execute(binary, directory)
-        uptake, release = rates['C0']
-        error = abs(uptake/reference-1.)
-        sphere_errors.append(error)
-        require(error < .25, f'sphere uptake error {error}')
-        require(abs(release/reference+1.) < .25, 'sphere supply error')
-        print(f'sphere N={n}: Q={uptake:.9g}, exact={reference:.9g}, '
-              f'relative error={error:.6g}', flush=True)
-    require(sphere_errors[-1] < .1 and sphere_errors[-1] < sphere_errors[0],
-            f'sphere refinement failed: {sphere_errors}')
-    for key, bad, message in [('k_s', -1., 'k_s must be finite'),
-                              ('prmol', 0., 'positive finite prmol')]:
-        directory = root/f'invalid-{key}'
-        config, _, _, _ = planar(directory)
-        scalar = config['scalar']['scalars'][0]
-        if key == 'prmol':
-            scalar[key] = bad
-        else:
-            scalar['geometries']['wall.stl'][key] = bad
-        execute(binary, directory, config, expect_failure=message)
-    print('Scalar Robin integration tests: PASS', flush=True)
+        for i, spec in enumerate(specs):
+            single = root/f'single-{i}'
+            planar(single, specs=(spec,))
+            isolated, _ = execute(binary, single)
+            require(np.max(np.abs(fields[f'C{i}']-isolated['C0'])) < 2.e-12,
+                    'scalar parameter cross-contamination')
+        return
+    if suite == 'legacy':
+        for kind in ('flux', 'value'):
+            directory = root/f'legacy-{kind}'
+            _, _, exact, flux = planar(directory, kind=kind,
+                                      specs=((1., 1.e12, .2, 1.),))
+            fields, _ = execute(binary, directory)
+            check_planar(fields, exact, None, flux, tolerance=.025)
+        return
+    if suite == 'transient':
+        # Time convergence from a nonsteady state, fixed mesh and final time.
+        solutions = []
+        for scale in (1., .5, .25):
+            directory = root/f'time-{scale}'
+            planar(directory, n=12, initial=1., duration=.05, dt_scale=scale)
+            fields, _ = execute(binary, directory)
+            solutions.append(fields['C0'])
+        e1 = np.linalg.norm(solutions[0]-solutions[1])
+        e2 = np.linalg.norm(solutions[1]-solutions[2])
+        require(e2 < .3*e1, f'RK time convergence failed: {e1}, {e2}')
+        print(f'RK refinement differences: {e1:.6g}, {e2:.6g}', flush=True)
+        # Restart and MPI use the same transient as an uninterrupted run.
+        directory = root/'restart'
+        config, _, _, _ = planar(directory, n=12, initial=1., duration=.05)
+        whole = copy.deepcopy(config)
+        first = copy.deepcopy(config)
+        first['time']['mtstep'] = whole['time']['mtstep']//2
+        execute(binary, directory, first)
+        second = copy.deepcopy(config)
+        second['time'].update({'read': True, 'continue': True,
+                              'mtstep': whole['time']['mtstep']-first['time']['mtstep']})
+        second['ib']['blocking'] = 'useblock'
+        resumed, _ = execute(binary, directory, second)
+        require(np.max(np.abs(resumed['C0']-solutions[0])) < 2.e-11,
+                'restart differs from uninterrupted integration')
+        directory = root/'mpi'
+        config, _, _, _ = planar(directory, n=12, initial=1., duration=.05)
+        split_grid(directory/'grids.h5')
+        serial_blocks, _ = execute(binary, directory)
+        parallel, _ = execute(binary, directory, ranks=2)
+        require(np.max(np.abs(parallel['C0']-serial_blocks['C0'])) < 2.e-11,
+                'MPI differs from serial')
+        return
+    if suite == 'sphere':
+        sphere_errors = []
+        for n in (16, 24, 32):
+            directory = root/f'sphere-{n}'
+            _, _, reference = shell(directory, n)
+            fields, rates = execute(binary, directory)
+            uptake, release = rates['C0']
+            error = abs(uptake/reference-1.)
+            sphere_errors.append(error)
+            require(error < .25, f'sphere uptake error {error}')
+            require(abs(release/reference+1.) < .25, 'sphere supply error')
+            print(f'sphere N={n}: Q={uptake:.9g}, exact={reference:.9g}, '
+                  f'relative error={error:.6g}', flush=True)
+        require(sphere_errors[-1] < .1 and sphere_errors[-1] < sphere_errors[0],
+                f'sphere refinement failed: {sphere_errors}')
+        return
+    if suite == 'invalid':
+        for key, bad, message in [('k_s', -1., 'k_s must be finite'),
+                                  ('prmol', 0., 'positive finite prmol')]:
+            directory = root/f'invalid-{key}'
+            config, _, _, _ = planar(directory)
+            scalar = config['scalar']['scalars'][0]
+            if key == 'prmol':
+                scalar[key] = bad
+            else:
+                scalar['geometries']['wall.stl'][key] = bad
+            execute(binary, directory, config, expect_failure=message)
+        return
+    raise ValueError(f'Unknown suite: {suite}')
 
 
 if __name__ == '__main__':
