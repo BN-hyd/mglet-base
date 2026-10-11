@@ -27,3 +27,11 @@ jobs:
         run: |
           source /opt/bashrc || true
           ctest --test-dir build/tests --output-on-failure --timeout 180
+      - name: Preserve validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: robin-validation
+          path: |
+            build/tests/Testing/Temporary/LastTest.log
+            build/tests/ScalarRobin/runs/*/solver.log

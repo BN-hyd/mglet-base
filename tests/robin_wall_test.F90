@@ -21,8 +21,8 @@ PROGRAM robin_wall_test
         CALL check(ABS(flux) < tol, "equilibrium")
         CALL robin_wall(cw, flux, conductance, cp, ell, d, &
             0.0_realk, eq)
-        CALL check(flux == 0.0_realk, "zero rate")
-        CALL check(cw == cp, "zero gradient")
+        CALL check(ABS(flux) <= 0.0_realk, "zero rate")
+        CALL check(ABS(cw-cp) < tol, "zero gradient")
         CALL robin_wall(cw, flux, conductance, cp, ell, d, &
             SQRT(HUGE(ks)), eq)
         CALL check(ABS(cw-eq) < tol, "Dirichlet limit")

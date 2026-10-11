@@ -67,6 +67,7 @@ CONTAINS
         CHARACTER(len=mglet_filename_max + 64) :: jsonptr
         CHARACTER(len=16) :: type
         CHARACTER(len=10240) :: initial_expr
+        CHARACTER(len=nchar_name) :: buoyant_scalar
         LOGICAL :: kayscrawford, found
         REAL(realk) :: rvalue
 
@@ -169,6 +170,14 @@ CONTAINS
             END SELECT
 
             IF (scalar(l)%has_robin) THEN
+                IF (fort7%exists("/flow/buoyancy/scalar")) THEN
+                    CALL fort7%get_value("/flow/buoyancy/scalar", &
+                        buoyant_scalar)
+                    IF (buoyant_scalar == scalar(l)%name) THEN
+                        WRITE(*, *) "Robin scalar must remain passive"
+                        CALL errr(__FILE__, __LINE__)
+                    END IF
+                END IF
                 IF (.NOT. ieee_is_finite(scalar(l)%prmol) .OR. &
                         scalar(l)%prmol <= 0.0_realk) THEN
                     WRITE(*, *) "Robin scalar requires positive finite prmol"

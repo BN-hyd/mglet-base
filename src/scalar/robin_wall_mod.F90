@@ -17,7 +17,7 @@ CONTAINS
         REAL(realk) :: gd, ratio, weight
 
         gd = diffusivity/ell
-        IF (k_s == 0.0_realk) THEN
+        IF (k_s <= 0.0_realk) THEN
             conductance = 0.0_realk
             weight = 1.0_realk
         ELSE IF (k_s <= gd) THEN

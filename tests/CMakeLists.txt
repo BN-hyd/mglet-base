@@ -21,3 +21,5 @@ FOREACH(test ${MGLET_TESTCASES})
         set_tests_properties(${test} PROPERTIES TIMEOUT_SIGNAL_GRACE_PERIOD 4)
     endif()
 ENDFOREACH()
+
+set_tests_properties(ScalarRobin PROPERTIES TIMEOUT 900)

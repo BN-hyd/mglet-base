@@ -102,11 +102,11 @@ CONTAINS
                             scalar(l)%geometries(body)%k_s > 0.0_realk)
                     END DO
                     IF (.NOT. reactive) CYCLE
-                    IF (ANY(velocity(:, idx) /= 0.0_realk)) THEN
+                    IF (ANY(ABS(velocity(:, idx)) > 0.0_realk)) THEN
                         WRITE(*, *) "Robin supports stationary walls only"
                         CALL errr(__FILE__, __LINE__)
                     END IF
-                    IF (areas(idx) == 0.0_realk) CYCLE
+                    IF (ABS(areas(idx)) < TINY(1.0_realk)) CYCLE
                     norm = SQRT(SUM(nvecs(1:3, idx)**2))
                     IF (.NOT. ieee_is_finite(norm) .OR. &
                             ABS(norm - 1.0_realk) > 1.0e-4_realk .OR. &
@@ -127,6 +127,9 @@ CONTAINS
                     p = 0
                     dc = DOT_PRODUCT(nvecs(1:3, idx), [x(i), y(j), z(k)]) &
                         - nvecs(4, idx)
+                    si = 0
+                    sj = 0
+                    sk = 0
                     CALL wmcheckneighbor(k, j, i, kk, jj, ii, bp, &
                         bconds, nn, ni, nj, nk, si, sj, sk, nstc)
                     ai = si
