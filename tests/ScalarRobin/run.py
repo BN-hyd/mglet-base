@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import shutil
 from pathlib import Path
 import subprocess
@@ -158,7 +159,7 @@ def parameters(scalars, dt, steps, spherical=False):
                  'tu_level': 0., 'solve': False, 'lesmodel': {'model': 'none'}},
         'ib': {'type': 'ghostcell', 'blocking': 'newblock',
                'stencilfile': 'ib_stencils.h5',
-               'fluidpoints': [[1., 0., 0.] if spherical else [.5, .2, .2]],
+               'fluidpoints': [[.7, .3, .3] if spherical else [.5, .2, .2]],
                'geometries': [{'file': p} for p in walls]},
         'scalar': {'solve': True, 'scalars': scalars}, 'statistics': []}
 
@@ -266,9 +267,13 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
     if ranks > 1:
         command = ['mpirun', '-np', str(ranks)]+command
     with open(directory/'solver.log', 'w') as log:
+        env = dict(os.environ, GFORTRAN_UNBUFFERED_ALL='1')
         result = subprocess.run(command, cwd=directory, stdout=log,
-                                stderr=subprocess.STDOUT, timeout=240)
+                                stderr=subprocess.STDOUT, timeout=240, env=env)
     output = (directory/'solver.log').read_text(errors='replace')
+    for path in (directory/'LOGS').glob('*'):
+        if path.is_file():
+            output += path.read_text(errors='replace')
     if expect_failure:
         require(result.returncode != 0 and expect_failure in output,
                 f'{directory}: expected failure {expect_failure!r}, '
@@ -284,8 +289,11 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
             require(np.isfinite(values).all(), 'nonfinite budget')
             # time, mass, delta_mass, integrated supply, integrated uptake, residual
             scale = max(1., abs(values[1]))
-            require(abs(values[-1]) < 2.e-10*scale,
+            require(abs(values[-1]) < 2.e-12*scale,
                     f'{directory}: mass budget failed: {values}')
+            if directory.name.startswith(('sphere', 'multilevel')):
+                require(abs(values[3]) < 2.e-12*scale,
+                        'closed fluid region has nonzero external supply')
             budgets[p[1]] = values
         if p and p[0] == 'ROBIN_RATE':
             rates[p[1]] = [float(v) for v in p[3:]]
@@ -309,8 +317,8 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
             fields[name] = np.asarray(blocks).squeeze()
             require(np.isfinite(fields[name]).all(), 'nonfinite concentration')
     print(f'{directory.name}: rates={rates}, budgets={budgets}', flush=True)
-    if directory.name.startswith('sphere'):
-        print(output[:7000], flush=True)
+    if directory.name.startswith('sphere') and budgets['C0'][1] <= 0.:
+        raise AssertionError('Sphere has no fluid cells:\n'+output[:7000])
     return fields, rates
 
 
