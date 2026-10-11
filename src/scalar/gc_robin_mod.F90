@@ -190,6 +190,19 @@ CONTAINS
             END DO
         END DO
         grid%patch = work(1:count)
+        IF (ANY(scalar%robin_budget)) THEN
+            DO body = 1, SIZE(scalar(1)%geometries)
+                d = 0.0_realk
+                p = 0
+                DO n = 1, count
+                    IF (work(n)%body /= body) CYCLE
+                    d = d + work(n)%area
+                    p = p + 1
+                END DO
+                WRITE(*, *) "ROBIN_PATCHES rank body count area", &
+                    myid, body, p, d
+            END DO
+        END IF
         IF (fallback > 0) THEN
             WRITE(*, *) "Robin one-point fallback patches on rank", &
                 myid, ":", fallback

@@ -153,16 +153,18 @@ CONTAINS
                         CALL sc%get_value(jsonptr, rvalue)
                         IF (.NOT. ieee_is_finite(rvalue) .OR. &
                                 rvalue < 0.0_realk) THEN
-                            WRITE(*, *) "Robin k_s must be finite and >= 0"
-                            CALL errr(__FILE__, __LINE__)
+                            CALL err_abort(254_intk, &
+                                "Robin k_s must be finite and >= 0", &
+                                __FILE__, __LINE__)
                         END IF
                         scalar(l)%geometries(n)%k_s = rvalue
                         jsonptr = "/geometries/" // &
                             TRIM(ib%stlnames(n)) // "/c_eq"
                         CALL sc%get_value(jsonptr, rvalue, 0.0_realk)
                         IF (.NOT. ieee_is_finite(rvalue)) THEN
-                            WRITE(*, *) "Robin c_eq must be finite"
-                            CALL errr(__FILE__, __LINE__)
+                            CALL err_abort(254_intk, &
+                                "Robin c_eq must be finite", &
+                                __FILE__, __LINE__)
                         END IF
                         scalar(l)%geometries(n)%c_eq = rvalue
                     END IF
@@ -174,19 +176,22 @@ CONTAINS
                     CALL fort7%get_value("/flow/buoyancy/scalar", &
                         buoyant_scalar)
                     IF (buoyant_scalar == scalar(l)%name) THEN
-                        WRITE(*, *) "Robin scalar must remain passive"
-                        CALL errr(__FILE__, __LINE__)
+                        CALL err_abort(254_intk, &
+                            "Robin scalar must remain passive", &
+                            __FILE__, __LINE__)
                     END IF
                 END IF
                 IF (.NOT. ieee_is_finite(scalar(l)%prmol) .OR. &
                         scalar(l)%prmol <= 0.0_realk) THEN
-                    WRITE(*, *) "Robin scalar requires positive finite prmol"
-                    CALL errr(__FILE__, __LINE__)
+                    CALL err_abort(254_intk, &
+                        "Robin scalar requires positive finite prmol", &
+                        __FILE__, __LINE__)
                 END IF
                 rvalue = gmol/rho/scalar(l)%prmol
                 IF (.NOT. ieee_is_finite(rvalue) .OR. rvalue <= 0.0_realk) THEN
-                    WRITE(*, *) "Robin scalar requires positive finite D"
-                    CALL errr(__FILE__, __LINE__)
+                    CALL err_abort(254_intk, &
+                        "Robin scalar requires positive finite D", &
+                        __FILE__, __LINE__)
                 END IF
                 CALL sc%get_value("/robin_budget", &
                     scalar(l)%robin_budget, .FALSE.)

@@ -179,6 +179,13 @@ def planar(directory, n=24, specs=((1., 1., .2, 1.),),
         flux = (c0-eq)/(1./diff + 1./ks) if ks > 0 else 0.
         intercept = c0-flux/diff
         expression = f'{intercept:.17g}+({flux/diff:.17g})*x'
+        if kind == 'robin':
+            # BT may include a solid-side cell beyond the cut-cell owner.
+            # At discrete steady state that dead-end extension is constant;
+            # a linear extension would introduce an unintended transient.
+            cut_x = min(coords[0][2:-2], key=abs)
+            expression = (f'{intercept:.17g}+({flux/diff:.17g})'
+                          f'*max(x,{cut_x:.17g})')
         bc = {'type': kind, 'k_s': ks, 'c_eq': eq}
         if kind == 'value':
             bc = {'type': 'value', 'value': eq}
@@ -264,7 +271,8 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
     output = (directory/'solver.log').read_text(errors='replace')
     if expect_failure:
         require(result.returncode != 0 and expect_failure in output,
-                f'{directory}: invalid input did not fail as expected')
+                f'{directory}: expected failure {expect_failure!r}, '
+                f'code={result.returncode}\n{output[-5000:]}')
         return None, None
     require(result.returncode == 0, f'{directory}: solver failed\n{output[-4500:]}')
     require('SOLUTION EXPLODED' not in output, f'{directory}: exploded')
@@ -300,6 +308,9 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
                     int(g['KK']), int(g['JJ']), int(g['II'])).transpose(2, 1, 0))
             fields[name] = np.asarray(blocks).squeeze()
             require(np.isfinite(fields[name]).all(), 'nonfinite concentration')
+    print(f'{directory.name}: rates={rates}, budgets={budgets}', flush=True)
+    if directory.name.startswith('sphere'):
+        print(output[:7000], flush=True)
     return fields, rates
 
 
@@ -375,13 +386,14 @@ def run_suite(suite, binary, root):
     if suite == 'isolation':
         specs = ((1., 1., .2, 1.), (.3, 2., .1, .8))
         directory = root/'multiple'
-        _, _, exact, flux = planar(directory, specs=specs)
+        combined_config, _, exact, flux = planar(directory, specs=specs)
         fields, rates = execute(binary, directory)
         check_planar(fields, exact, rates, flux)
         for i, spec in enumerate(specs):
             single = root/f'single-{i}'
-            planar(single, specs=(spec,))
-            isolated, _ = execute(binary, single)
+            isolated_config, _, _, _ = planar(single, specs=(spec,))
+            isolated_config['time'] = copy.deepcopy(combined_config['time'])
+            isolated, _ = execute(binary, single, isolated_config)
             require(np.max(np.abs(fields[f'C{i}']-isolated['C0'])) < 2.e-12,
                     'scalar parameter cross-contamination')
         return
@@ -468,9 +480,18 @@ def run_suite(suite, binary, root):
                 require(abs(uptake) < 1.e-12,
                         'multilevel equilibrium has surface flux')
                 # Compare active cell values only; blocked cells are zero.
-                active = serial['C0'] > .1
-                require(np.max(np.abs(serial['C0'][active]-.7)) < 2.e-11,
-                        'multilevel equilibrium changed')
+                # Coarse covered cells and interpolated halo cells are not
+                # independent fluid unknowns. Compare physical fluid centers.
+                with h5py.File(directory/'grids.h5') as f:
+                    info = f['GRIDINFO'][:]
+                    error = 0.
+                    for block, g in zip(serial['C0'], info):
+                        xs = f[f'X/LEVEL{g["LEVEL"]}'][int(g['IGRIDLVL'])-1]
+                        physical = xs[2:-2] > -.01
+                        error = max(error, np.max(np.abs(
+                            block[2:-2, 2:-2, 2:-2][physical]-.7), initial=0.))
+                require(error < 2.e-11,
+                        f'multilevel equilibrium changed: {error}')
             else:
                 require(uptake > 0., 'missing multilevel surface reaction')
             print(f'three-level equilibrium={equilibrium}: Q={uptake:.9g}',
