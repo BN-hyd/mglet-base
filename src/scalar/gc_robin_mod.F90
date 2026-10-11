@@ -108,7 +108,8 @@ CONTAINS
                     END IF
                     IF (ABS(areas(idx)) < TINY(1.0_realk)) CYCLE
                     norm = SQRT(SUM(nvecs(1:3, idx)**2))
-                    IF (.NOT. ieee_is_finite(norm) .OR. &
+                    IF (.NOT. ALL(ieee_is_finite(nvecs(:, idx))) .OR. &
+                            .NOT. ieee_is_finite(norm) .OR. &
                             ABS(norm - 1.0_realk) > 1.0e-4_realk .OR. &
                             .NOT. ieee_is_finite(areas(idx)) .OR. &
                             areas(idx) < 0.0_realk .OR. &

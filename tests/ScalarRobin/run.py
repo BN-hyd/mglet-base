@@ -75,6 +75,41 @@ def stl(path, triangles):
         f.write('endsolid wall\n')
 
 
+def split_grid(path, n=12):
+    """Two connected blocks; the reactive plane crosses their MPI interface."""
+    temporary = [path.with_name(f'grid-part-{i}.h5') for i in range(2)]
+    for i, name in enumerate(temporary):
+        grid(name, (n, 4, 4), [(-.23, 1.), (.2*i, .2*(i+1)), (0., .4)], [1.])
+    with h5py.File(temporary[0]) as f0, h5py.File(temporary[1]) as f1:
+        with h5py.File(path, 'w') as f:
+            infos = np.concatenate([f0['GRIDINFO'][:], f1['GRIDINFO'][:]])
+            infos['IGRID'] = [1, 2]
+            infos['IGRIDLVL'] = [1, 2]
+            infos['NBRGRID'][0, 3] = 2  # LEFT = positive y
+            infos['NBRGRID'][1, 2] = 1  # RIGHT = negative y
+            info = f.create_dataset('GRIDINFO', data=infos)
+            info.attrs.update(dict(f0['GRIDINFO'].attrs))
+            for name in f0:
+                if name == 'GRIDINFO':
+                    continue
+                if isinstance(f0[name], h5py.Group):
+                    group = f.create_group(name)
+                    group.attrs.update(dict(f0[name].attrs))
+                    group.create_dataset('LEVEL1', data=np.concatenate(
+                        [f0[name+'/LEVEL1'][:], f1[name+'/LEVEL1'][:]]))
+                else:
+                    bc = np.concatenate([f0[name][:], f1[name][:]])
+                    for idx, face in ((0, 'LEFT'), (1, 'RIGHT')):
+                        if name == face:
+                            bc['NBOCD'][idx] = 1
+                            bc['TYPE'][idx] = [b'CON', b'']
+                            bc['INTPRM'][idx] = 0
+                            bc['REALPRM'][idx] = 0
+                    f.create_dataset(name, data=bc)
+    for name in temporary:
+        name.unlink()
+
+
 def box(path):
     vertices = np.array([[x, y, z] for x in (-2., 0.)
                         for y in (-2., 2.) for z in (-2., 2.)])
@@ -261,6 +296,10 @@ def main():
         _, _, exact, flux = planar(directory, n=n)
         fields, rates = execute(binary, directory)
         check_planar(fields, exact, rates, flux)
+    directory = root/'relax-to-steady'
+    _, _, exact, flux = planar(directory, n=12, initial=1., duration=5.)
+    fields, rates = execute(binary, directory)
+    check_planar(fields, exact, rates, flux, tolerance=4.e-3)
     for name, spec in [('zero', (1., 0., .2, 1.)),
                        ('strong', (1., 1.e12, .2, 1.)),
                        ('equal', (1., 1., .2, .2)),
@@ -307,14 +346,16 @@ def main():
     second = copy.deepcopy(config)
     second['time'].update({'read': True, 'continue': True,
                           'mtstep': whole['time']['mtstep']-first['time']['mtstep']})
-    second['ib']['blocking'] = 'read'
+    second['ib']['blocking'] = 'useblock'
     resumed, _ = execute(binary, directory, second)
     require(np.max(np.abs(resumed['C0']-solutions[0])) < 2.e-11,
             'restart differs from uninterrupted integration')
     directory = root/'mpi'
-    planar(directory, n=12, initial=1., duration=.05)
+    config, _, _, _ = planar(directory, n=12, initial=1., duration=.05)
+    split_grid(directory/'grids.h5')
+    serial_blocks, _ = execute(binary, directory)
     parallel, _ = execute(binary, directory, ranks=2)
-    require(np.max(np.abs(parallel['C0']-solutions[0])) < 2.e-11,
+    require(np.max(np.abs(parallel['C0']-serial_blocks['C0'])) < 2.e-11,
             'MPI differs from serial')
     sphere_errors = []
     for n in (16, 24, 32):

@@ -3,6 +3,7 @@ PROGRAM robin_wall_test
     USE robin_wall_mod, ONLY: robin_wall
     IMPLICIT NONE(type, external)
     REAL(realk) :: cw, flux, conductance, d, ks, eq, cp, ell, tol, exact
+    REAL(realk) :: distances(3), observations(3), weights(3), target
     INTEGER :: n
 
     tol = 100.0_realk*EPSILON(tol)
@@ -30,6 +31,18 @@ PROGRAM robin_wall_test
         CALL robin_wall(cw, flux, conductance, -cp, ell, d, ks, eq)
         CALL check(flux < 0.0_realk, "reverse flux")
     END DO
+    ! Nonuniform multipoint normal reconstruction of a known linear field.
+    distances = [0.1_realk, 0.3_realk, 0.8_realk]
+    weights = distances/SUM(distances)
+    ell = SUM(distances**2)/SUM(distances)
+    d = 0.4_realk
+    ks = 1.7_realk
+    target = 0.2_realk
+    observations = eq + target/ks + target*distances/d
+    cp = SUM(weights*observations)
+    CALL robin_wall(cw, flux, conductance, cp, ell, d, ks, eq)
+    CALL check(ABS(flux-target) < tol, "multipoint normal fit")
+    CALL check(ABS(cw-eq-target/ks) < tol, "multipoint wall value")
     PRINT *, "Robin wall kernel: PASS"
 CONTAINS
     SUBROUTINE check(ok, name)
