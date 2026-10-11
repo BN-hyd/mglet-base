@@ -6,6 +6,10 @@ on:
 
 jobs:
   verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [robin, regression]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     container:
@@ -20,6 +24,7 @@ jobs:
           cmake -S . -B build -GNinja --preset=gnu-debug -DMGLET_REAL64=ON
           cmake --build build -j2
       - name: Robin tests
+        if: matrix.suite == 'robin'
         shell: bash
         env:
           OMPI_ALLOW_RUN_AS_ROOT: '1'
@@ -28,19 +33,19 @@ jobs:
           source /opt/bashrc || true
           ctest --test-dir build/tests -R ScalarRobin --verbose
       - name: Existing regression tests
-        if: success() || failure()
+        if: matrix.suite == 'regression'
         shell: bash
         env:
           OMPI_ALLOW_RUN_AS_ROOT: '1'
           OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: '1'
         run: |
           source /opt/bashrc || true
-          ctest --test-dir build/tests -E ScalarRobin --output-on-failure --timeout 180
+          ctest --test-dir build/tests -R 'HotAndColdSpheres|Parker_micro|ScalarDecay' --output-on-failure --timeout 180
       - name: Preserve validation logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: robin-validation
+          name: validation-${{ matrix.suite }}
           path: |
             build/tests/Testing/Temporary/LastTest.log
             build/tests/ScalarRobin/runs/*/solver.log

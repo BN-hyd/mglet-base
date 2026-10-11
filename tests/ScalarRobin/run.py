@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import math
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -111,8 +112,8 @@ def split_grid(path, n=12):
         name.unlink()
 
 
-def box(path):
-    vertices = np.array([[x, y, z] for x in (-2., 0.)
+def box(path, wall=0.):
+    vertices = np.array([[x, y, z] for x in (-2., wall)
                         for y in (-2., 2.) for z in (-2., 2.)])
     triangles = []
     for face in ((0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1),
@@ -185,7 +186,7 @@ def planar(directory, n=24, specs=((1., 1., .2, 1.),),
             bc = {'type': 'flux', 'value': -flux}
         scalars.append({'name': f'C{index}', 'prmol': 1./diff,
                         'initial_value': expression if initial is None
-                        else initial, 'robin_budget': True,
+                        else initial, 'robin_budget': kind == 'robin',
                         'geometries': {'wall.stl': bc}})
         exact.append(intercept+flux/diff*coords[0][2:-2])
         fluxes.append(flux*.4*.4)
@@ -217,6 +218,38 @@ def shell(directory, n):
     config = parameters([scalar], duration/steps, steps, spherical=True)
     (directory/'parameters.json').write_text(json.dumps(config, indent=2))
     return config, coords, q
+
+
+def multilevel(directory, equilibrium):
+    """Existing 36-block / three-level mesh, plane crossing refinement edges."""
+    directory.mkdir(parents=True, exist_ok=True)
+    candidates = [p/'tests/Parker_micro/grids.h5'
+                  for p in Path(__file__).resolve().parents]
+    fixture = next((p for p in candidates if p.is_file()), None)
+    require(fixture is not None, 'Parker_micro grid fixture not found')
+    shutil.copyfile(fixture, directory/'grids.h5')
+    with h5py.File(directory/'grids.h5', 'r+') as f:
+        f['GRIDINFO'].attrs['INTPRMS'] = np.array([1], dtype='<i4')
+        f['GRIDINFO'].attrs['REALPRMS'] = np.array([0.], dtype='<f8')
+        for face in ('FRONT', 'BACK', 'RIGHT', 'LEFT', 'BOTTOM', 'TOP'):
+            data = f[face][:]
+            for row in data:
+                if row['TYPE'][0].strip() in (b'CON', b'PAR'):
+                    continue
+                row['NBOCD'] = 2
+                row['TYPE'] = [b'NOS', b'SWA']
+                row['INTPRM'] = [[0, 0], [1, 1]]
+                row['REALPRM'] = [[0, 0], [1, 1]]
+            f[face][...] = data
+    box(directory/'wall.stl', wall=-.0193)
+    scalar = {'name': 'C0', 'prmol': 1., 'initial_value': .7,
+              'robin_budget': True,
+              'geometries': {'wall.stl': {'type': 'robin', 'k_s': 1.,
+                                         'c_eq': .7 if equilibrium else 0.}}}
+    config = parameters([scalar], 1.e-8, 10)
+    config['ib']['fluidpoints'] = [[.1, .05, .05]]
+    (directory/'parameters.json').write_text(json.dumps(config, indent=2))
+    return config
 
 
 def execute(binary, directory, config=None, ranks=1, expect_failure=None):
@@ -259,10 +292,12 @@ def execute(binary, directory, config=None, ranks=1, expect_failure=None):
         for scalar in config['scalar']['scalars']:
             name = scalar['name']
             # fieldio2 stores flattened, transposed (i-fastest) grid data.
-            raw = f['VOLUMEFIELDS/'+name+'/LEVEL1'][...]
-            blocks = [row[:int(g['II']*g['JJ']*g['KK'])].reshape(
-                int(g['KK']), int(g['JJ']), int(g['II'])).transpose(2, 1, 0)
-                for row, g in zip(raw, info)]
+            blocks = []
+            for g in info:
+                row = f[f'VOLUMEFIELDS/{name}/LEVEL{g["LEVEL"]}'][
+                    int(g['IGRIDLVL'])-1]
+                blocks.append(row[:int(g['II']*g['JJ']*g['KK'])].reshape(
+                    int(g['KK']), int(g['JJ']), int(g['II'])).transpose(2, 1, 0))
             fields[name] = np.asarray(blocks).squeeze()
             require(np.isfinite(fields[name]).all(), 'nonfinite concentration')
     return fields, rates
@@ -303,7 +338,7 @@ def main():
     if args.suite == 'all':
         failed = []
         for suite in ('planar', 'limits', 'isolation', 'legacy',
-                      'transient', 'sphere', 'invalid'):
+                      'transient', 'sphere', 'multilevel', 'invalid'):
             result = subprocess.run([sys.executable, __file__, '--solver',
                                      binary, '--work', str(root),
                                      '--suite', suite])
@@ -419,6 +454,27 @@ def run_suite(suite, binary, root):
             else:
                 scalar['geometries']['wall.stl'][key] = bad
             execute(binary, directory, config, expect_failure=message)
+        return
+    if suite == 'multilevel':
+        for equilibrium in (True, False):
+            directory = root/f'multilevel-{equilibrium}'
+            multilevel(directory, equilibrium)
+            serial, rates = execute(binary, directory)
+            parallel, _ = execute(binary, directory, ranks=2)
+            require(np.max(np.abs(serial['C0']-parallel['C0'])) < 2.e-11,
+                    'multilevel MPI differs from serial')
+            uptake = sum(rates['C0'])
+            if equilibrium:
+                require(abs(uptake) < 1.e-12,
+                        'multilevel equilibrium has surface flux')
+                # Compare active cell values only; blocked cells are zero.
+                active = serial['C0'] > .1
+                require(np.max(np.abs(serial['C0'][active]-.7)) < 2.e-11,
+                        'multilevel equilibrium changed')
+            else:
+                require(uptake > 0., 'missing multilevel surface reaction')
+            print(f'three-level equilibrium={equilibrium}: Q={uptake:.9g}',
+                  flush=True)
         return
     raise ValueError(f'Unknown suite: {suite}')
 

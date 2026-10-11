@@ -91,6 +91,7 @@ CONTAINS
                 CALL set_scastencils("P", scalar(l), qtt=qtt)
             END IF
 
+            reaction%arr = 0.0_realk
             IF (scalar(l)%has_robin) THEN
                 CALL apply_robin(qtt, reaction, t, scalar(l), dt, &
                     MAXVAL(ABS(rkscheme%b(1:rkscheme%nrk))))
